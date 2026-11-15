@@ -89,6 +89,7 @@ interface TablePlayer {
   holeCards: Card[];
   currentStreetBet: number;
   totalRoundBet: number;
+  hasActedThisStreet?: boolean;
   folded: boolean;
   isAllIn: boolean;
   isDealer: boolean;
@@ -411,6 +412,7 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
         holeCards: p.holeCards || [],
         currentStreetBet: p.currentStreetBet || 0,
         totalRoundBet: p.totalRoundBet || 0,
+        hasActedThisStreet: Boolean(p.hasActedThisStreet),
         folded: Boolean(p.folded),
         isAllIn: Boolean(p.isAllIn),
         isDealer: Boolean(p.isDealer),
@@ -467,6 +469,7 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
         holeCards: [],
         currentStreetBet: 0,
         totalRoundBet: 0,
+        hasActedThisStreet: false,
         folded: false,
         isAllIn: false,
         isDealer: true
@@ -739,6 +742,7 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
         holeCards: [c1, c2],
         currentStreetBet: blind,
         totalRoundBet: blind,
+        hasActedThisStreet: false,
         folded: false,
         isAllIn: baseChips <= blind,
         isDealer: idx === 0
@@ -800,10 +804,16 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
       showToast(`Aguarde! Agora é a vez de ${currentTurnPlayer?.username || 'outro jogador'}.`);
       return;
     }
+    const curr = tablePlayers[activePlayerIndex];
+    const toCall = Math.max(0, currentHighestBet - (curr?.currentStreetBet || 0));
+    if (toCall === 0) {
+      showToast('Ninguém apostou ainda! Use Check ou Raise.');
+      return;
+    }
     soundManager.playLoss();
     const updated = [...tablePlayers];
     const currName = updated[activePlayerIndex]?.username || 'Jogador';
-    updated[activePlayerIndex] = { ...updated[activePlayerIndex], folded: true };
+    updated[activePlayerIndex] = { ...updated[activePlayerIndex], folded: true, hasActedThisStreet: true };
     setTablePlayers(updated);
     if (activeRoom?.id) {
       void enviarJogadaRtdb(activeRoom.id, {
@@ -822,7 +832,7 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     }
     soundManager.playClick();
     const updated = [...tablePlayers];
-    const curr = { ...updated[activePlayerIndex] };
+    const curr = { ...updated[activePlayerIndex], hasActedThisStreet: true };
     const needed = Math.max(0, currentHighestBet - curr.currentStreetBet);
     let nextPot = multiPot;
 
@@ -855,30 +865,41 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
       showToast(`Aguarde! Agora é a vez de ${currentTurnPlayer?.username || 'outro jogador'}.`);
       return;
     }
-    const updated = [...tablePlayers];
-    const curr = { ...updated[activePlayerIndex] };
-    if (!curr.username) return;
+    const currOld = tablePlayers[activePlayerIndex];
+    if (!currOld?.username) return;
     if (multiRaiseAmount <= 0) {
       showToast('Adicione fichas ao Raise antes de apostar!');
       return;
     }
-    if (multiRaiseAmount > curr.chips) {
-      showToast(`Saldo insuficiente! ${curr.username} possui ${curr.chips.toLocaleString('pt-BR')} fichas.`);
+    if (multiRaiseAmount > currOld.chips) {
+      showToast(`Saldo insuficiente! ${currOld.username} possui ${currOld.chips.toLocaleString('pt-BR')} fichas.`);
       return;
     }
-    const targetRaise = Math.min(curr.chips, multiRaiseAmount);
+    const targetRaise = Math.min(currOld.chips, multiRaiseAmount);
+    const curr = { ...currOld };
 
     soundManager.playChip();
     curr.chips -= targetRaise;
     curr.currentStreetBet += targetRaise;
     curr.totalRoundBet += targetRaise;
+    curr.hasActedThisStreet = true;
     if (curr.chips === 0) curr.isAllIn = true;
-    updated[activePlayerIndex] = curr;
 
-    const nextHighest = curr.currentStreetBet > currentHighestBet ? curr.currentStreetBet : currentHighestBet;
-    if (curr.currentStreetBet > currentHighestBet) {
+    const raisedHighest = curr.currentStreetBet > currentHighestBet;
+    const nextHighest = raisedHighest ? curr.currentStreetBet : currentHighestBet;
+    if (raisedHighest) {
       setCurrentHighestBet(curr.currentStreetBet);
     }
+
+    // If the highest bet increased, other active non-all-in players must respond again (Call, Raise, or Fold)
+    const updated = tablePlayers.map((p, idx) => {
+      if (idx === activePlayerIndex) return curr;
+      if (raisedHighest && !p.folded && !p.isAllIn) {
+        return { ...p, hasActedThisStreet: false };
+      }
+      return p;
+    });
+
     const nextPot = multiPot + targetRaise;
     setMultiPot(nextPot);
     setTablePlayers(updated);
@@ -932,9 +953,12 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
       loops++;
     }
 
-    const allMatched = active.every(p => p.isAllIn || p.currentStreetBet === highestVal);
+    const nonAllInActive = active.filter(p => !p.isAllIn);
+    const allMatched = active.every(
+      p => p.isAllIn || (Boolean(p.hasActedThisStreet) && p.currentStreetBet === highestVal)
+    );
 
-    if (allMatched && loops < currentList.length) {
+    if (allMatched || (nonAllInActive.length <= 1 && active.every(p => p.isAllIn || p.currentStreetBet >= highestVal))) {
       advanceMultiStreet(currentList, potVal);
     } else {
       setActivePlayerIndex(nextIdx);
@@ -963,7 +987,7 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
   };
 
   const advanceMultiStreet = (currentList: TablePlayer[], potVal = multiPot) => {
-    const resetList = currentList.map(p => ({ ...p, currentStreetBet: 0 }));
+    const resetList = currentList.map(p => ({ ...p, currentStreetBet: 0, hasActedThisStreet: false }));
     let firstActiveIdx = resetList.findIndex(p => !p.folded && !p.isAllIn);
     if (firstActiveIdx === -1) firstActiveIdx = 0;
 
@@ -1770,15 +1794,15 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
         ) : (
           /* ================= MULTIPLAYER CONTROLS ================= */
           !activeRoom ? (
-            <div className="text-center text-xs text-orange-200/80 py-1.5">
+            <div className="text-center text-xs text-orange-200/80 py-1">
               Crie uma sala ou clique em uma mesa aberta acima para jogar com outros jogadores em tempo real.
             </div>
           ) : multiStage === 'WAITING' || multiStage === 'SHOWDOWN' ? (
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2">
-              <div className="flex items-center gap-1.5 flex-wrap text-xs text-orange-200">
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-1.5">
+              <div className="flex items-center gap-1 flex-wrap text-[11px] text-orange-200">
                 <span className="font-bold text-amber-300">Na Mesa ({tablePlayers.length}/8):</span>
                 {tablePlayers.map(p => (
-                  <span key={p.uid || p.username} className="px-2 py-0.5 rounded-md bg-[#250d09] border border-orange-500/30 text-white font-mono text-[11px] font-bold">
+                  <span key={p.uid || p.username} className="px-1.5 py-0.5 rounded-md bg-[#250d09] border border-orange-500/30 text-white font-mono text-[10.5px] font-bold">
                     {p.username}
                   </span>
                 ))}
@@ -1789,94 +1813,103 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
                   type="button"
                   onClick={startNewMultiplayerHand}
                   disabled={tablePlayers.length < 2}
-                  className="px-6 py-2 rounded-xl bg-gradient-to-r from-orange-500 via-red-600 to-amber-500 hover:brightness-110 text-white font-cinzel font-black text-xs sm:text-sm shadow-xl flex items-center justify-center gap-2 cursor-pointer disabled:opacity-40 shrink-0"
+                  className="px-5 py-2 rounded-xl bg-gradient-to-r from-orange-500 via-red-600 to-amber-500 hover:brightness-110 text-white font-cinzel font-black text-xs sm:text-sm shadow-xl flex items-center justify-center gap-2 cursor-pointer disabled:opacity-40 shrink-0 border-2 border-yellow-300/70"
                 >
                   <Play className="w-4 h-4 fill-current" />
-                  <span>{multiStage === 'SHOWDOWN' ? 'Nova Mão de Pôquer 🃏' : `Iniciar Partida (${tablePlayers.length} Jogadores) 🃏`}</span>
+                  <span>
+                    {tablePlayers.length < 2
+                      ? `AGUARDANDO JOGADORES (${tablePlayers.length}/2)...`
+                      : multiStage === 'SHOWDOWN'
+                      ? 'INICIAR NOVA PARTIDA 🃏'
+                      : 'INICIAR PARTIDA 🃏'}
+                  </span>
                 </button>
               ) : (
-                <div className="px-4 py-2 rounded-xl bg-[#250d09] border border-amber-500/35 text-amber-200 text-xs font-bold text-center shrink-0">
+                <div className="px-3 py-1.5 rounded-xl bg-[#250d09] border border-amber-500/35 text-amber-200 text-[11px] font-bold text-center shrink-0">
                   {tablePlayers.length < 2
-                    ? 'Aguardando mais jogadores...'
-                    : `Aguardando anfitrião (${activeRoom.host}) iniciar...`}
+                    ? `Aguardando mínimo 2 jogadores (${tablePlayers.length}/2)...`
+                    : `Aguardando anfitrião (${activeRoom.host}) clicar em "INICIAR PARTIDA"...`}
                 </div>
               )}
             </div>
           ) : (
-            <div className="space-y-1.5">
-              <ChipSelector
-                currentBet={multiRaiseAmount}
-                balance={tablePlayers[activePlayerIndex]?.chips || 0}
-                onBetChange={setMultiRaiseAmount}
-                label={`Raise (${tablePlayers[activePlayerIndex]?.username || 'Vez'}):`}
-                showInput={true}
-                showDouble={false}
-              />
+            (() => {
+              const toCall = Math.max(0, currentHighestBet - (tablePlayers[activePlayerIndex]?.currentStreetBet || 0));
+              return (
+                <div className="space-y-1">
+                  <ChipSelector
+                    currentBet={multiRaiseAmount}
+                    balance={tablePlayers[activePlayerIndex]?.chips || 0}
+                    onBetChange={setMultiRaiseAmount}
+                    label={`Raise (${tablePlayers[activePlayerIndex]?.username || 'Vez'}):`}
+                    compact={true}
+                    showDouble={false}
+                  />
 
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                {isFirestoreRoom ? (
-                  <button
-                    type="button"
-                    onClick={() => setHideMyHoleCards(prev => !prev)}
-                    className="px-3 py-1.5 rounded-xl bg-[#2a0e08] hover:bg-[#3d140b] border border-amber-500/40 text-amber-300 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
-                  >
-                    {hideMyHoleCards ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
-                    <span>{hideMyHoleCards ? 'Mostrar Minhas Cartas' : 'Ocultar Minhas Cartas'}</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => setPeekHoleCards(prev => !prev)}
-                    className="px-3 py-1.5 rounded-xl bg-[#2a0e08] hover:bg-[#3d140b] border border-amber-500/40 text-amber-300 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
-                  >
-                    {peekHoleCards ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                    <span>{peekHoleCards ? 'Ocultar Cartas' : `Espiar Cartas (${tablePlayers[activePlayerIndex]?.username})`}</span>
-                  </button>
-                )}
+                  <div className="flex flex-wrap items-center justify-between gap-1.5">
+                    {isFirestoreRoom ? (
+                      <button
+                        type="button"
+                        onClick={() => setHideMyHoleCards(prev => !prev)}
+                        className="px-2.5 py-1.5 rounded-xl bg-[#2a0e08] hover:bg-[#3d140b] border border-amber-500/40 text-amber-300 text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                      >
+                        {hideMyHoleCards ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+                        <span>{hideMyHoleCards ? 'Mostrar Cartas' : 'Ocultar'}</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setPeekHoleCards(prev => !prev)}
+                        className="px-2.5 py-1.5 rounded-xl bg-[#2a0e08] hover:bg-[#3d140b] border border-amber-500/40 text-amber-300 text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                      >
+                        {peekHoleCards ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                        <span>{peekHoleCards ? 'Ocultar' : `Espiar (${tablePlayers[activePlayerIndex]?.username})`}</span>
+                      </button>
+                    )}
 
-                <div className="flex items-center gap-2 flex-wrap">
-                  {isFirestoreRoom && !isMyTurn && (
-                    <span className="text-[11px] font-bold text-amber-300/90 px-2">
-                      Aguardando vez de {currentTurnPlayer?.username}...
-                    </span>
-                  )}
+                    <div className="flex items-center gap-1.5 flex-wrap justify-end flex-1">
+                      {isFirestoreRoom && !isMyTurn && (
+                        <span className="text-[10.5px] font-bold text-amber-300/90 px-1.5">
+                          Vez de {currentTurnPlayer?.username}...
+                        </span>
+                      )}
 
-                  <button
-                    type="button"
-                    onClick={handleMultiFold}
-                    disabled={!isMyTurn}
-                    className="px-3.5 py-1.5 rounded-xl bg-red-950/90 hover:bg-red-900 border border-red-500/60 text-red-200 font-bold text-xs sm:text-sm cursor-pointer flex items-center gap-1.5 shadow disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    <XCircle className="w-4 h-4" />
-                    <span>Fold</span>
-                  </button>
+                      {toCall > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleMultiFold}
+                          disabled={!isMyTurn}
+                          className="px-3 py-1.5 rounded-xl bg-red-950/90 hover:bg-red-900 border border-red-500/60 text-red-200 font-bold text-xs cursor-pointer flex items-center gap-1 shadow disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          <XCircle className="w-3.5 h-3.5" />
+                          <span>Fold</span>
+                        </button>
+                      )}
 
-                  <button
-                    type="button"
-                    onClick={handleMultiCallOrCheck}
-                    disabled={!isMyTurn}
-                    className="px-3.5 py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-600 border border-emerald-400 text-white font-bold text-xs sm:text-sm cursor-pointer flex items-center gap-1.5 shadow disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    <Check className="w-4 h-4" />
-                    <span>
-                      {Math.max(0, currentHighestBet - (tablePlayers[activePlayerIndex]?.currentStreetBet || 0)) > 0
-                        ? `Call (${Math.max(0, currentHighestBet - (tablePlayers[activePlayerIndex]?.currentStreetBet || 0))})`
-                        : 'Check'}
-                    </span>
-                  </button>
+                      <button
+                        type="button"
+                        onClick={handleMultiCallOrCheck}
+                        disabled={!isMyTurn}
+                        className="px-3 py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-600 border border-emerald-400 text-white font-bold text-xs cursor-pointer flex items-center gap-1 shadow disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                        <span>{toCall > 0 ? `Call (${toCall})` : 'Check'}</span>
+                      </button>
 
-                  <button
-                    type="button"
-                    onClick={handleMultiRaise}
-                    disabled={!isMyTurn || multiRaiseAmount <= 0 || multiRaiseAmount > (tablePlayers[activePlayerIndex]?.chips || 0)}
-                    className="px-4 py-1.5 rounded-xl bg-gradient-to-r from-orange-500 via-amber-500 to-yellow-500 hover:brightness-110 text-slate-950 font-black text-xs sm:text-sm cursor-pointer flex items-center gap-1.5 shadow-lg disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    <ArrowUpRight className="w-4 h-4" />
-                    <span>Raise (+{multiRaiseAmount.toLocaleString('pt-BR')} Fichas)</span>
-                  </button>
+                      <button
+                        type="button"
+                        onClick={handleMultiRaise}
+                        disabled={!isMyTurn || multiRaiseAmount <= 0 || multiRaiseAmount > (tablePlayers[activePlayerIndex]?.chips || 0)}
+                        className="px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-orange-500 via-amber-500 to-yellow-500 hover:brightness-110 text-slate-950 font-black text-xs cursor-pointer flex items-center gap-1 shadow-lg disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <ArrowUpRight className="w-3.5 h-3.5" />
+                        <span>Raise (+{multiRaiseAmount.toLocaleString('pt-BR')})</span>
+                      </button>
+                    </div>
+                  </div>
                 </div>
-              </div>
-            </div>
+              );
+            })()
           )
         )}
       </div>

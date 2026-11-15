@@ -408,7 +408,7 @@ export default function App() {
         <main className={`flex-1 w-full mx-auto transition-all ${
           !isFullViewportGame
             ? 'max-w-7xl px-3 sm:px-6 py-3 sm:py-5'
-            : (activeGame === 'plinko' || activeGame === 'miner' || activeGame === 'scratch' || activeGame === 'classic-slots' || activeGame === 'horse-race' || activeGame === 'archery' || activeGame === 'dragon-egg' || activeGame === 'liars-bar' || activeGame === 'texas-holdem')
+            : (activeGame === 'plinko' || activeGame === 'miner' || activeGame === 'scratch' || activeGame === 'classic-slots' || activeGame === 'horse-race' || activeGame === 'archery' || activeGame === 'dragon-egg' || activeGame === 'liars-bar' || activeGame === 'texas-holdem' || activeGame === 'blackjack')
               ? 'max-w-7xl px-1.5 sm:px-3 py-1 flex flex-col min-h-0 overflow-hidden'
               : 'max-w-7xl px-1.5 sm:px-3 py-1 flex flex-col min-h-0 overflow-y-auto overflow-x-hidden'
         }`}>

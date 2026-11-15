@@ -143,8 +143,14 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
   const [rtdbTimer, setRtdbTimer] = useState<RoomTimerState | null>(null);
   const [rtdbEstadoLive, setRtdbEstadoLive] = useState<RtdbEstadoJogo | null>(null);
   const [myReady, setMyReady] = useState<boolean>(false);
+  const [showChatDrawer, setShowChatDrawer] = useState<boolean>(false);
   const presenceHandleRef = useRef<{ setReady: (pronto: boolean) => Promise<void>; disconnect: () => Promise<void> } | null>(null);
   const lastTimerTurnRef = useRef<string>('');
+  const onUpdateBalanceRef = useRef(onUpdateBalance);
+
+  useEffect(() => {
+    onUpdateBalanceRef.current = onUpdateBalance;
+  }, [onUpdateBalance]);
 
   const effectiveUid = firebaseUid || auth.currentUser?.uid || null;
   const playerName = (currentUser?.nickname || currentUser?.username || auth.currentUser?.displayName || 'Jogador').slice(0, 32);
@@ -657,93 +663,99 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
     }
   };
 
-  // Resolve Dealer play & evaluate all seated players
-  const resolveDealerAndFinish = (
+  // Resolve PvP hands against 21 (No Dealer in Multiplayer: highest non-busted score wins pot, ties split)
+  const resolvePvpAndFinish = (
     currentBaralho: Card[],
-    currentDealerHand: Card[],
     maosJogadores: Record<string, Card[]>,
     apostasJogadores: Record<string, number>,
     jogadores: string[],
     jogadoresInfo: Record<string, PlayerMetaInfo> | undefined,
     roundId: number
   ): BlackjackEstadoJogo => {
-    const dDeck = [...currentBaralho];
-    const dHand = [...currentDealerHand];
-    let dScore = calculateBlackjackScore(dHand);
-
-    while (dScore.score < 17 && dDeck.length > 0) {
-      dHand.push(dDeck.pop()!);
-      dScore = calculateBlackjackScore(dHand);
-    }
-
     const resultadosJogadores: Record<string, PlayerResultInfo> = {};
-    const winners: string[] = [];
+    let totalPot = 0;
 
-    for (const pUid of jogadores) {
+    const evaluated = jogadores.map((pUid) => {
       const pHand = maosJogadores[pUid] || [];
       const pBet = apostasJogadores[pUid] || 50;
+      totalPot += pBet;
       const pEval = calculateBlackjackScore(pHand);
       const pName = jogadoresInfo?.[pUid]?.nome || 'Jogador';
+      return { pUid, pBet, pEval, pName };
+    });
 
-      if (pEval.isBust) {
-        resultadosJogadores[pUid] = {
-          outcome: 'LOSS',
-          payout: 0,
-          score: pEval.score,
-          message: `Estourou com ${pEval.score}`
-        };
-      } else if (pEval.isBlackjack && !dScore.isBlackjack) {
-        const payout = Math.floor(pBet * 2.5);
-        winners.push(`${pName} (Blackjack!)`);
-        resultadosJogadores[pUid] = {
-          outcome: 'BLACKJACK',
-          payout,
-          score: pEval.score,
-          message: `Blackjack Natural 3:2 (+${payout})`
-        };
-      } else if (dScore.isBlackjack && !pEval.isBlackjack) {
-        resultadosJogadores[pUid] = {
-          outcome: 'LOSS',
-          payout: 0,
-          score: pEval.score,
-          message: `Dealer fez Blackjack (${pEval.score} vs 21)`
-        };
-      } else if (dScore.isBust || pEval.score > dScore.score) {
-        const payout = pBet * 2;
-        winners.push(pName);
-        resultadosJogadores[pUid] = {
-          outcome: 'WIN',
-          payout,
-          score: pEval.score,
-          message: dScore.isBust
-            ? `Dealer estourou (${dScore.score}) · +${payout}`
-            : `Venceu ${pEval.score} vs ${dScore.score} · +${payout}`
-        };
-      } else if (pEval.score === dScore.score) {
-        resultadosJogadores[pUid] = {
+    const nonBusted = evaluated.filter((item) => !item.pEval.isBust);
+
+    let summaryMsg = '';
+
+    if (nonBusted.length === 0) {
+      for (const item of evaluated) {
+        resultadosJogadores[item.pUid] = {
           outcome: 'PUSH',
-          payout: pBet,
-          score: pEval.score,
-          message: `Empate em ${pEval.score} (devolvido)`
-        };
-      } else {
-        resultadosJogadores[pUid] = {
-          outcome: 'LOSS',
-          payout: 0,
-          score: pEval.score,
-          message: `Dealer venceu (${dScore.score} vs ${pEval.score})`
+          payout: item.pBet,
+          score: item.pEval.score,
+          message: `Todos estouraram! Aposta devolvida (+${item.pBet})`
         };
       }
+      summaryMsg = 'Todos os jogadores estouraram! Apostas devolvidas.';
+    } else {
+      const maxScore = Math.max(...nonBusted.map((item) => item.pEval.score));
+      const topScorers = nonBusted.filter((item) => item.pEval.score === maxScore);
+      const naturalWinners = maxScore === 21 ? topScorers.filter((item) => item.pEval.isBlackjack) : [];
+      const winners = naturalWinners.length > 0 ? naturalWinners : topScorers;
+      const winnerUids = new Set(winners.map((w) => w.pUid));
+
+      const baseShare = Math.floor(totalPot / winners.length);
+      let remainder = totalPot - baseShare * winners.length;
+
+      for (const item of evaluated) {
+        if (item.pEval.isBust) {
+          resultadosJogadores[item.pUid] = {
+            outcome: 'LOSS',
+            payout: 0,
+            score: item.pEval.score,
+            message: `Estourou com ${item.pEval.score} pontos`
+          };
+        } else if (winnerUids.has(item.pUid)) {
+          const share = baseShare + (remainder > 0 ? 1 : 0);
+          if (remainder > 0) remainder--;
+          if (winners.length > 1) {
+            resultadosJogadores[item.pUid] = {
+              outcome: winners.length === evaluated.length ? 'PUSH' : 'WIN',
+              payout: share,
+              score: item.pEval.score,
+              message: `Empate em ${item.pEval.score} pts · Dividiu pote (+${share})`
+            };
+          } else {
+            resultadosJogadores[item.pUid] = {
+              outcome: item.pEval.isBlackjack ? 'BLACKJACK' : 'WIN',
+              payout: share,
+              score: item.pEval.score,
+              message: item.pEval.isBlackjack
+                ? `Blackjack Natural 21! Levou o pote (+${share})`
+                : `Maior mão (${item.pEval.score} pts) · Levou +${share}`
+            };
+          }
+        } else {
+          resultadosJogadores[item.pUid] = {
+            outcome: 'LOSS',
+            payout: 0,
+            score: item.pEval.score,
+            message: `Superado com ${item.pEval.score} vs ${maxScore} pts`
+          };
+        }
+      }
+
+      const winnerNames = winners.map((w) => `${w.pName} (${w.pEval.score})`).join(' e ');
+      summaryMsg =
+        winners.length > 1
+          ? `Empate! ${winnerNames} dividiram o pote de ${totalPot.toLocaleString('pt-BR')} fichas!`
+          : `${winnerNames} venceu o pote de ${totalPot.toLocaleString('pt-BR')} fichas!`;
     }
 
-    const summaryMsg =
-      winners.length > 0
-        ? `Rodada finalizada! Vencedor(es): ${winners.join(', ')} | Dealer: ${dScore.score}${dScore.isBust ? ' (Bust)' : ''}`
-        : `Rodada finalizada! Dealer fez ${dScore.score}${dScore.isBust ? ' (Bust)' : ''}.`;
-
     return {
-      baralho: dDeck,
-      maoDealer: dHand,
+      baralho: currentBaralho,
+      maoDealer: [],
       maosJogadores,
       apostasJogadores,
       jogadoresFinalizados: [...jogadores],
@@ -758,7 +770,11 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
   const handleMultiStartRound = async () => {
     if (!activeRoom || !effectiveUid) return;
     if (activeRoom.criadorId !== effectiveUid) {
-      showToast('Apenas o anfitrião da sala pode distribuir as cartas!');
+      showToast('Apenas o anfitrião da sala pode iniciar a partida!');
+      return;
+    }
+    if ((activeRoom.jogadores?.length || 0) < 2) {
+      showToast('Aguarde pelo menos 2 jogadores entrarem na sala para iniciar!');
       return;
     }
     if (balance < multiBet || multiBet <= 0) {
@@ -771,7 +787,6 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
     soundManager.playShuffle();
 
     const freshDeck = shuffleDeck(createDeck());
-    const maoDealer = [freshDeck.pop()!, freshDeck.pop()!];
     const maosJogadores: Record<string, Card[]> = {};
     const apostasJogadores: Record<string, number> = {};
     const jogadoresFinalizados: string[] = [];
@@ -797,9 +812,8 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
     let nextStatus: MultiStatus;
 
     if (!nextTurn) {
-      nextEstado = resolveDealerAndFinish(
+      nextEstado = resolvePvpAndFinish(
         freshDeck,
-        maoDealer,
         maosJogadores,
         apostasJogadores,
         activeRoom.jogadores,
@@ -811,7 +825,7 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
       const turnName = activeRoom.jogadoresInfo?.[nextTurn]?.nome || 'Jogador';
       nextEstado = {
         baralho: freshDeck,
-        maoDealer,
+        maoDealer: [],
         maosJogadores,
         apostasJogadores,
         jogadoresFinalizados,
@@ -883,9 +897,8 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
     let nextStatus: MultiStatus;
 
     if (!nextTurn) {
-      nextEstado = resolveDealerAndFinish(
+      nextEstado = resolvePvpAndFinish(
         nextDeck,
-        estado.maoDealer,
         updatedMaos,
         estado.apostasJogadores || {},
         activeRoom.jogadores,
@@ -951,9 +964,8 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
     let nextStatus: MultiStatus;
 
     if (!nextTurn) {
-      nextEstado = resolveDealerAndFinish(
+      nextEstado = resolvePvpAndFinish(
         estado.baralho,
-        estado.maoDealer,
         estado.maosJogadores,
         estado.apostasJogadores || {},
         activeRoom.jogadores,
@@ -1029,9 +1041,8 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
     let nextStatus: MultiStatus;
 
     if (!nextTurn) {
-      nextEstado = resolveDealerAndFinish(
+      nextEstado = resolvePvpAndFinish(
         nextDeck,
-        estado.maoDealer,
         updatedMaos,
         updatedBets,
         activeRoom.jogadores,
@@ -1114,9 +1125,8 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
               : estado.turnoAtual;
 
           if (!nextTurn) {
-            nextEstado = resolveDealerAndFinish(
+            nextEstado = resolvePvpAndFinish(
               estado.baralho,
-              estado.maoDealer,
               estado.maosJogadores,
               estado.apostasJogadores || {},
               remaining,
@@ -1196,44 +1206,54 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
     </div>
   );
 
-  // ---------------- MULTIPLAYER ROOMS LOBBY VIEW ----------------
+  // ---------------- MULTIPLAYER ROOMS LOBBY VIEW (100vh Mobile Fit) ----------------
   if (gameMode === 'MULTIPLAYER' && !activeRoomId) {
     return (
-      <div className="space-y-2.5 max-w-4xl mx-auto animate-fade-in pb-2">
+      <div className="h-full max-h-full min-h-0 flex flex-col justify-between gap-1.5 overflow-hidden max-w-4xl mx-auto animate-fade-in">
         {toastMsg && (
-          <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 bg-red-950/95 border border-amber-400 text-amber-200 px-4 py-2 rounded-xl text-xs font-bold shadow-2xl">
+          <div className="fixed top-14 left-1/2 -translate-x-1/2 z-50 bg-red-950/95 border border-amber-400 text-amber-200 px-3 py-1.5 rounded-xl text-xs font-bold shadow-2xl">
             {toastMsg}
           </div>
         )}
 
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <button
-            type="button"
-            onClick={onBackToLobby}
-            className="flex items-center gap-1.5 text-xs font-semibold text-slate-400 hover:text-amber-300 transition-colors cursor-pointer"
-          >
-            <ArrowLeft className="w-3.5 h-3.5" />
-            <span>Voltar ao Lobby</span>
-          </button>
+        <div className="shrink-0 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2.5">
+            <button
+              type="button"
+              onClick={onBackToLobby}
+              className="flex items-center gap-1 text-xs font-semibold text-slate-400 hover:text-amber-300 transition-colors cursor-pointer"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" />
+              <span>Lobby</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowHowToPlay(true)}
+              className="inline-flex items-center gap-1 text-[11px] text-orange-300/80 hover:text-amber-300 cursor-pointer"
+            >
+              <HelpCircle className="w-3.5 h-3.5 text-orange-400" />
+              <span className="hidden sm:inline">Regras</span>
+            </button>
+          </div>
 
           {modeToggleBar}
         </div>
 
-        <div className="casino-felt casino-wood-border rounded-xl p-3 sm:p-4 space-y-3 shadow-xl">
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-amber-500/20 pb-2">
+        <div className="casino-felt casino-wood-border rounded-xl p-2.5 sm:p-3 flex-1 min-h-0 flex flex-col justify-between gap-2 shadow-xl overflow-hidden">
+          <div className="shrink-0 flex flex-wrap items-center justify-between gap-1 border-b border-amber-500/20 pb-1.5">
             <div>
-              <h2 className="font-cinzel text-sm sm:text-base font-black text-amber-300 flex items-center gap-2">
+              <h2 className="font-cinzel text-xs sm:text-sm font-black text-amber-300 flex items-center gap-1.5">
                 <Users className="w-4 h-4 text-orange-400" />
-                <span>Salas de Blackjack Multiplayer (até 4 Jogadores)</span>
+                <span>Blackjack Multiplayer PvP (2 a 4 Jogadores)</span>
               </h2>
-              <p className="text-[11px] text-orange-200/75">
-                Sincronização em tempo real via Firebase Firestore · Jogue na mesma mesa contra o Crupiê!
+              <p className="text-[10.5px] text-orange-200/75">
+                Sem Crupiê · Jogador contra Jogador em tempo real · Quem chegar mais perto de 21 leva o pote!
               </p>
             </div>
           </div>
 
           {!effectiveUid ? (
-            <div className="bg-[#180604]/90 border border-amber-500/40 rounded-xl p-5 text-center space-y-3">
+            <div className="flex-1 flex flex-col items-center justify-center bg-[#180604]/90 border border-amber-500/40 rounded-xl p-4 text-center space-y-3">
               <p className="text-xs sm:text-sm text-orange-100 font-semibold">
                 Para criar ou entrar em salas multiplayer sincronizadas em tempo real, faça login com E-mail e Senha no Firebase.
               </p>
@@ -1249,21 +1269,21 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
           ) : (
             <>
               {/* Create Room Box */}
-              <div className="bg-[#180705]/95 border border-orange-500/30 rounded-xl p-3 space-y-2.5">
-                <div className="flex flex-col sm:flex-row gap-2">
+              <div className="shrink-0 bg-[#180705]/95 border border-orange-500/30 rounded-xl p-2 space-y-1.5">
+                <div className="flex flex-col sm:flex-row gap-1.5">
                   <input
                     type="text"
                     maxLength={50}
                     value={newRoomName}
                     onChange={(e) => setNewRoomName(e.target.value)}
                     placeholder={`Nome da mesa (ex: Mesa VIP de ${playerName})`}
-                    className="flex-1 px-3 py-2 rounded-xl bg-[#100402] border border-orange-500/30 text-xs text-orange-100 placeholder-orange-300/35 focus:outline-none focus:border-amber-400"
+                    className="flex-1 px-2.5 py-1.5 rounded-xl bg-[#100402] border border-orange-500/30 text-xs text-orange-100 placeholder-orange-300/35 focus:outline-none focus:border-amber-400"
                   />
                   <button
                     type="button"
                     disabled={multiBusy || multiBet <= 0 || multiBet > balance}
                     onClick={handleCreateRoom}
-                    className="px-4 py-2 rounded-xl bg-gradient-to-r from-orange-500 via-red-600 to-amber-500 hover:brightness-110 text-white font-cinzel font-black text-xs shadow-lg flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40"
+                    className="px-4 py-1.5 rounded-xl bg-gradient-to-r from-orange-500 via-red-600 to-amber-500 hover:brightness-110 text-white font-cinzel font-black text-xs shadow-lg flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40"
                   >
                     {multiBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
                     <span>Criar Sala (4 Lugares)</span>
@@ -1274,20 +1294,20 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
                   currentBet={multiBet}
                   balance={balance}
                   onBetChange={setMultiBet}
-                  label="Aposta Base da Mesa:"
+                  label="Aposta:"
                   compact={true}
                 />
               </div>
 
               {/* Open Rooms List */}
-              <div className="space-y-2 max-h-[260px] overflow-y-auto pr-1">
+              <div className="flex-1 min-h-0 space-y-1.5 overflow-y-auto pr-1">
                 {roomsLoading ? (
-                  <div className="py-8 text-center text-xs text-orange-200/70 flex items-center justify-center gap-2">
+                  <div className="py-6 text-center text-xs text-orange-200/70 flex items-center justify-center gap-2">
                     <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
                     <span>Carregando salas de Blackjack em tempo real...</span>
                   </div>
                 ) : rooms.length === 0 ? (
-                  <div className="py-8 text-center text-xs text-orange-200/70 border border-dashed border-orange-500/25 rounded-xl">
+                  <div className="py-6 text-center text-xs text-orange-200/70 border border-dashed border-orange-500/25 rounded-xl">
                     Nenhuma mesa de Blackjack aberta no momento. Crie a primeira sala acima!
                   </div>
                 ) : (
@@ -1301,15 +1321,15 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
                     return (
                       <div
                         key={room.id}
-                        className="bg-[#1b0805]/90 border border-orange-500/30 rounded-xl p-2.5 sm:p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                        className="bg-[#1b0805]/90 border border-orange-500/30 rounded-xl p-2 flex items-center justify-between gap-2"
                       >
-                        <div className="space-y-0.5">
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <span className="font-cinzel font-bold text-xs sm:text-sm text-amber-200">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="font-cinzel font-bold text-xs text-amber-200 truncate">
                               {room.nome}
                             </span>
                             <span
-                              className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-full border ${
+                              className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-full border ${
                                 room.status === 'aguardando'
                                   ? 'bg-emerald-950/80 text-emerald-300 border-emerald-500/40'
                                   : room.status === 'jogando'
@@ -1320,10 +1340,10 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
                               {room.status}
                             </span>
                           </div>
-                          <div className="text-[11px] text-orange-200/75 flex items-center gap-3 flex-wrap">
-                            <span>Anfitrião: <strong className="text-amber-300">{room.criadorNome}</strong></span>
-                            <span>Jogadores: <strong className="text-emerald-300">{count}/{maxP}</strong></span>
-                            <span>Aposta mín: <strong className="text-amber-300">🪙 {(room.apostaMinima || 50).toLocaleString('pt-BR')}</strong></span>
+                          <div className="text-[10.5px] text-orange-200/75 flex items-center gap-2 flex-wrap">
+                            <span>Host: <strong className="text-amber-300">{room.criadorNome}</strong></span>
+                            <span>· <strong className="text-emerald-300">{count}/{maxP}</strong></span>
+                            <span>· 🪙 {(room.apostaMinima || 50).toLocaleString('pt-BR')}</span>
                           </div>
                         </div>
 
@@ -1331,15 +1351,15 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
                           type="button"
                           disabled={multiBusy || isFull || cannotEnterPlaying}
                           onClick={() => handleJoinRoom(room)}
-                          className="px-4 py-2 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:brightness-110 text-slate-950 font-cinzel font-black text-xs shadow cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                          className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:brightness-110 text-slate-950 font-cinzel font-black text-[11px] shadow cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
                         >
                           {isInside
-                            ? 'Retornar à Mesa ♠'
+                            ? 'Voltar ♠'
                             : isFull
-                            ? 'Mesa Cheia (4/4)'
+                            ? 'Cheia'
                             : cannotEnterPlaying
-                            ? 'Em Andamento'
-                            : 'Entrar na Sala ♠'}
+                            ? 'Jogando'
+                            : 'Entrar ♠'}
                         </button>
                       </div>
                     );
@@ -1350,115 +1370,131 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
           )}
         </div>
 
-        <div className="pt-0.5 text-center">
-          <button
-            type="button"
-            onClick={() => setShowHowToPlay(true)}
-            className="inline-flex items-center gap-1 text-[11px] text-orange-300/70 hover:text-amber-300 transition-colors cursor-pointer py-0.5"
-          >
-            <HelpCircle className="w-3 h-3 text-orange-400" />
-            <span>Regras & Como Jogar Blackjack Multiplayer</span>
-          </button>
-        </div>
-
         <HowToPlayModal isOpen={showHowToPlay} onClose={() => setShowHowToPlay(false)} gameId="blackjack" />
       </div>
     );
   }
 
-  // ---------------- MULTIPLAYER ACTIVE TABLE VIEW ----------------
+  // ---------------- MULTIPLAYER ACTIVE TABLE VIEW (NO DEALER · PvP · 100vh MOBILE FIT) ----------------
   if (gameMode === 'MULTIPLAYER' && activeRoomId) {
     const estado = activeRoom?.estadoJogo;
     const multiStatus: MultiStatus = estado?.status || 'aguardando';
-    const multiDealerHand = estado?.maoDealer || [];
-    const hideMultiDealerHole = multiStatus === 'jogando';
-    const multiDealerEval = calculateBlackjackScore(multiDealerHand);
     const isMyTurn = multiStatus === 'jogando' && estado?.turnoAtual === effectiveUid;
     const isCreator = activeRoom?.criadorId === effectiveUid;
+    const seatedCount = activeRoom?.jogadores?.length || 0;
     const myMultiHand = (effectiveUid && estado?.maosJogadores?.[effectiveUid]) || [];
     const myMultiBet = (effectiveUid && estado?.apostasJogadores?.[effectiveUid]) || multiBet;
+    const poteMesa = (activeRoom?.jogadores || []).reduce(
+      (sum, u) => sum + (estado?.apostasJogadores?.[u] ?? activeRoom?.jogadoresInfo?.[u]?.aposta ?? activeRoom?.apostaMinima ?? 50),
+      0
+    );
 
     return (
-      <div className="space-y-2 max-w-4xl mx-auto animate-fade-in pb-1">
+      <div className="h-full max-h-full min-h-0 flex flex-col justify-between gap-1.5 overflow-hidden max-w-4xl mx-auto animate-fade-in">
         {toastMsg && (
-          <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 bg-red-950/95 border border-amber-400 text-amber-200 px-4 py-2 rounded-xl text-xs font-bold shadow-2xl">
+          <div className="fixed top-14 left-1/2 -translate-x-1/2 z-50 bg-red-950/95 border border-amber-400 text-amber-200 px-3 py-1.5 rounded-xl text-xs font-bold shadow-2xl">
             {toastMsg}
           </div>
         )}
 
-        {/* Top Header Navigation */}
-        <div className="flex flex-wrap items-center justify-between gap-2">
+        {/* Compact Header */}
+        <div className="shrink-0 flex flex-wrap items-center justify-between gap-1.5">
           <button
             type="button"
             onClick={handleLeaveRoom}
-            className="flex items-center gap-1.5 text-xs font-semibold text-slate-300 hover:text-amber-300 transition-colors cursor-pointer"
+            className="flex items-center gap-1 text-xs font-semibold text-slate-300 hover:text-amber-300 transition-colors cursor-pointer"
           >
             <DoorOpen className="w-3.5 h-3.5 text-orange-400" />
-            <span>Sair da Sala</span>
+            <span>Sair</span>
           </button>
 
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-cinzel font-bold text-amber-400 uppercase tracking-wider">
-              {activeRoom?.nome || 'Mesa Blackjack'} ({activeRoom?.jogadores.length || 1}/4)
-            </span>
-          </div>
+          <span className="text-[11px] sm:text-xs font-cinzel font-bold text-amber-400 uppercase tracking-wider truncate max-w-[160px] sm:max-w-xs">
+            {activeRoom?.nome || 'Blackjack PvP'} ({seatedCount}/4)
+          </span>
 
-          {modeToggleBar}
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setShowChatDrawer((prev) => !prev)}
+              className={`px-2 py-1 rounded-lg border text-[10.5px] font-bold cursor-pointer ${
+                showChatDrawer
+                  ? 'bg-amber-500 text-slate-950 border-amber-300'
+                  : 'bg-[#180705] border-orange-500/35 text-amber-300'
+              }`}
+            >
+              💬 Chat ({rtdbChat.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowHowToPlay(true)}
+              className="p-1 rounded-lg bg-[#180705] border border-orange-500/30 text-orange-300 hover:text-amber-300 cursor-pointer"
+              title="Regras"
+            >
+              <HelpCircle className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
 
-        {/* Multiplayer Table Felt */}
-        <div className="casino-felt casino-wood-border rounded-xl p-2.5 sm:p-3 flex flex-col justify-between gap-2 relative shadow-xl overflow-hidden">
-          {/* Dealer Zone */}
-          <div className="relative z-10 space-y-1">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5">
-                <span className="text-[11px] font-cinzel font-bold tracking-widest text-amber-300 uppercase">
-                  Dealer (Crupiê)
-                </span>
-                {multiDealerHand.length > 0 && !hideMultiDealerHole && (
-                  <span className="bg-slate-900/80 border border-amber-500/30 px-1.5 py-0.2 rounded text-[10px] font-mono font-bold text-amber-300">
-                    {multiDealerEval.score} {multiDealerEval.isBust ? '(Bust)' : ''}
-                  </span>
-                )}
-              </div>
-              {hideMultiDealerHole && multiDealerHand.length > 0 && (
-                <span className="text-[10px] text-slate-300 italic">
-                  Visível: {multiDealerHand[0]?.label}
-                </span>
-              )}
-            </div>
+        {/* Optional Collapsible Realtime Chat & Presence Drawer */}
+        {showChatDrawer && (
+          <div className="shrink-0">
+            <RoomChatAndPresence
+              presenceMap={rtdbPresence}
+              chatMessages={rtdbChat}
+              timer={rtdbTimer}
+              myUid={effectiveUid}
+              myReady={myReady}
+              showReadyToggle={multiStatus === 'aguardando' || multiStatus === 'finalizado'}
+              onToggleReady={() => {
+                const next = !myReady;
+                setMyReady(next);
+                void presenceHandleRef.current?.setReady(next);
+              }}
+              onSendMessage={async (msg) => {
+                if (!activeRoomId) return;
+                await sendRoomChatMessage(activeRoomId, playerName, msg, effectiveUid || undefined);
+              }}
+              turnPlayerName={
+                (estado?.turnoAtual && activeRoom?.jogadoresInfo?.[estado.turnoAtual]?.nome) || undefined
+              }
+              isMyTurn={isMyTurn}
+              onTimerExpire={() => {
+                if (isMyTurn && !multiBusy) {
+                  void handleMultiStand();
+                }
+              }}
+            />
+          </div>
+        )}
 
-            <div className="flex items-center gap-1.5 min-h-[68px] flex-wrap">
-              {multiDealerHand.length === 0 ? (
-                <div className="w-12 h-16 rounded border border-dashed border-amber-400/20 flex items-center justify-center text-[9px] text-amber-400/40">
-                  Dealer
-                </div>
-              ) : (
-                multiDealerHand.map((card, idx) => (
-                  <PlayingCard
-                    key={card.id || idx}
-                    card={card}
-                    hidden={idx === 1 && hideMultiDealerHole}
-                    flipDelayMs={idx === 0 ? 450 : (idx - 1) * 260}
-                    size="xs"
-                  />
-                ))
-              )}
+        {/* Multiplayer PvP Table Felt (NO DEALER) */}
+        <div className="casino-felt casino-wood-border rounded-xl p-2 sm:p-2.5 flex-1 min-h-0 flex flex-col justify-between gap-1.5 relative shadow-xl overflow-hidden">
+          {/* Top PvP Pot & Status Strip */}
+          <div className="relative z-10 shrink-0 flex items-center justify-between gap-2 bg-[#140402]/90 border border-amber-500/35 rounded-lg px-2.5 py-1">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="text-[10px] sm:text-xs font-cinzel font-black text-amber-300 uppercase truncate">
+                {multiStatus === 'aguardando'
+                  ? 'Sala de Espera · PvP (21)'
+                  : 'Blackjack PvP · Sem Crupiê'}
+              </span>
+            </div>
+            <div className="shrink-0 flex items-center gap-1.5 font-mono text-[11px] font-black text-amber-300 bg-[#260905] border border-amber-500/50 px-2.5 py-0.5 rounded-full">
+              <span>🪙</span>
+              <span>Pote: {poteMesa.toLocaleString('pt-BR')}</span>
             </div>
           </div>
 
           {/* Center Status / Turn Message */}
           {(estado?.mensagem || rtdbEstadoLive?.ultimaAcao) && (
-            <div className="relative z-20 text-center">
-              <div className="inline-block px-3 py-1 rounded-lg bg-[#140402]/90 border border-amber-500/40 text-amber-200 font-cinzel font-bold text-[11px] sm:text-xs shadow-lg">
+            <div className="relative z-20 shrink-0 text-center">
+              <div className="inline-block px-2.5 py-0.5 rounded-lg bg-[#140402]/90 border border-amber-500/40 text-amber-200 font-cinzel font-bold text-[10.5px] sm:text-xs shadow">
                 {estado?.mensagem || rtdbEstadoLive?.ultimaAcao}
-                {rtdbEstadoLive?.apostaAtual ? ` · Aposta: 🪙 ${rtdbEstadoLive.apostaAtual}` : ''}
               </div>
             </div>
           )}
 
-          {/* Seated Players (Up to 4) */}
-          <div className="relative z-10 grid grid-cols-1 sm:grid-cols-2 gap-2">
+          {/* Seated Players Grid (2 to 4 Players, fits 100vh on mobile) */}
+          <div className="relative z-10 flex-1 min-h-0 overflow-y-auto grid grid-cols-2 gap-1.5 content-start">
             {(activeRoom?.jogadores || []).map((pUid) => {
               const pInfo = activeRoom?.jogadoresInfo?.[pUid];
               const pHand = estado?.maosJogadores?.[pUid] || [];
@@ -1471,7 +1507,7 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
               return (
                 <div
                   key={pUid}
-                  className={`rounded-xl p-2 border transition-all ${
+                  className={`rounded-xl p-1.5 sm:p-2 border transition-all flex flex-col justify-between ${
                     isTurn
                       ? 'bg-amber-500/15 border-amber-400 ring-2 ring-amber-400/70 shadow-lg'
                       : isMe
@@ -1479,75 +1515,61 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
                       : 'bg-[#170604]/85 border-orange-500/25'
                   }`}
                 >
-                  <div className="flex items-center justify-between gap-1 mb-1">
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <span className="text-sm">{pInfo?.avatar || '🦁'}</span>
-                      <span className="text-xs font-bold text-orange-100 truncate">
+                  <div className="flex items-center justify-between gap-1 mb-0.5">
+                    <div className="flex items-center gap-1 min-w-0">
+                      <span className="text-xs">{pInfo?.avatar || '🦁'}</span>
+                      <span className="text-[11px] font-bold text-orange-100 truncate">
                         {pInfo?.nome || 'Jogador'}
+                        {isMe ? ' (Você)' : ''}
                       </span>
-                      {isMe && (
-                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-orange-500/30 text-amber-200 font-bold">
-                          Você
-                        </span>
-                      )}
                       {activeRoom?.criadorId === pUid && (
                         <Crown className="w-3 h-3 text-amber-400 shrink-0" />
                       )}
-                      {(() => {
-                        const pres = rtdbPresence[pUid];
-                        if (!pres) return null;
-                        return (
-                          <span className="inline-flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded-full bg-black/40 border border-white/10">
-                            <span className={`w-1.5 h-1.5 rounded-full ${pres.online ? 'bg-emerald-400' : 'bg-red-500'}`} />
-                            <span className={pres.online ? 'text-emerald-300' : 'text-red-300'}>
-                              {pres.pronto && multiStatus === 'aguardando' ? 'Pronto' : pres.online ? 'Online' : 'Offline'}
-                            </span>
-                          </span>
-                        );
-                      })()}
                     </div>
 
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      <span className="text-[10px] font-mono text-amber-300 font-bold">
-                        🪙 {pBet}
+                    <div className="flex items-center gap-1 shrink-0">
+                      <span className="text-[9.5px] font-mono text-amber-300 font-bold">
+                        🪙{pBet}
                       </span>
-                      {pHand.length > 0 && (
-                        <span className="bg-slate-900/90 border border-amber-500/30 px-1.5 py-0.2 rounded text-[10px] font-mono font-bold text-amber-300">
+                      {pHand.length > 0 && (isMe || multiStatus === 'finalizado') && (
+                        <span className="bg-slate-900/90 border border-amber-500/30 px-1 rounded text-[10px] font-mono font-bold text-amber-300">
                           {pEval.score}
-                          {pEval.isBust ? ' Bust' : pEval.isBlackjack ? ' BJ!' : ''}
+                          {pEval.isBust ? '!' : ''}
                         </span>
                       )}
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-1 min-h-[60px] flex-wrap">
+                  <div className="flex items-center gap-1 min-h-[54px] flex-wrap justify-center">
                     {pHand.length === 0 ? (
-                      <div className="text-[10px] text-orange-300/45 italic flex items-center gap-1">
+                      <div className="text-[10px] text-emerald-300/80 font-semibold flex items-center gap-1">
                         <UserCheck className="w-3 h-3" />
-                        <span>Pronto na mesa</span>
+                        <span>Na Sala de Espera</span>
                       </div>
                     ) : (
                       pHand.map((card, cIdx) => (
                         <PlayingCard
                           key={card.id || cIdx}
                           card={card}
+                          hidden={!isMe && multiStatus !== 'finalizado'}
                           size="xs"
-                          floating={isMe}
-                          flipDelayMs={cIdx < 2 ? cIdx * 250 : 0}
+                          floating={false}
+                          tilt3d={false}
+                          flipDelayMs={cIdx < 2 ? cIdx * 200 : 0}
                         />
                       ))
                     )}
                   </div>
 
                   {isTurn && (
-                    <div className="mt-1 text-[10px] font-bold text-amber-300 animate-pulse">
-                      ● Vez de jogar agora
+                    <div className="mt-0.5 text-[9.5px] font-bold text-amber-300 animate-pulse text-center">
+                      ● Vez de jogar
                     </div>
                   )}
 
                   {multiStatus === 'finalizado' && pResult && (
                     <div
-                      className={`mt-1 text-[10px] font-bold px-2 py-0.5 rounded border inline-block ${
+                      className={`mt-0.5 text-[9.5px] font-bold px-1.5 py-0.5 rounded border text-center truncate ${
                         pResult.outcome === 'WIN' || pResult.outcome === 'BLACKJACK'
                           ? 'bg-emerald-950/80 text-emerald-300 border-emerald-500/50'
                           : pResult.outcome === 'PUSH'
@@ -1564,10 +1586,10 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
           </div>
         </div>
 
-        {/* Multiplayer Controls */}
-        <div className="space-y-1.5">
+        {/* Always-Visible Bottom Multiplayer Controls */}
+        <div className="shrink-0 space-y-1">
           {multiStatus === 'aguardando' || multiStatus === 'finalizado' ? (
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-1.5">
               <div className="flex-1">
                 <ChipSelector
                   currentBet={multiBet}
@@ -1582,33 +1604,37 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
                 <button
                   type="button"
                   onClick={handleMultiStartRound}
-                  disabled={multiBusy || multiBet <= 0 || multiBet > balance}
-                  className="py-2.5 px-5 rounded-xl bg-gradient-to-r from-orange-500 via-red-600 to-amber-500 hover:brightness-110 text-white font-cinzel font-black text-xs sm:text-sm shadow-xl shadow-orange-600/40 disabled:opacity-40 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-1.5 cursor-pointer shrink-0 border border-orange-300/40"
+                  disabled={multiBusy || seatedCount < 2 || multiBet <= 0 || multiBet > balance}
+                  className="py-2.5 px-5 rounded-xl bg-gradient-to-r from-orange-500 via-red-600 to-amber-500 hover:brightness-110 text-white font-cinzel font-black text-xs sm:text-sm shadow-xl shadow-orange-600/40 disabled:opacity-40 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-1.5 cursor-pointer shrink-0 border-2 border-yellow-300/70"
                 >
                   {multiBusy ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <Loader2 className="w-4 h-4 animate-spin" />
                   ) : multiStatus === 'finalizado' ? (
-                    <RotateCcw className="w-3.5 h-3.5" />
+                    <RotateCcw className="w-4 h-4" />
                   ) : (
-                    <Play className="w-3.5 h-3.5 fill-current" />
+                    <Play className="w-4 h-4 fill-current" />
                   )}
                   <span>
-                    {multiStatus === 'finalizado' ? 'Nova Rodada ♠' : 'Distribuir Cartas ♠'}
+                    {seatedCount < 2
+                      ? `AGUARDANDO JOGADORES (${seatedCount}/2)...`
+                      : multiStatus === 'finalizado'
+                      ? 'INICIAR NOVA PARTIDA ♠'
+                      : 'INICIAR PARTIDA ♠'}
                   </span>
                 </button>
               ) : (
-                <div className="py-2.5 px-4 rounded-xl bg-[#180705] border border-orange-500/30 text-xs text-amber-300 font-semibold text-center">
-                  Aguardando {activeRoom?.criadorNome} iniciar a rodada...
+                <div className="py-2 px-3 rounded-xl bg-[#180705] border border-orange-500/30 text-[11px] text-amber-300 font-semibold text-center shrink-0">
+                  Aguardando {activeRoom?.criadorNome} clicar em &quot;INICIAR PARTIDA&quot; ({seatedCount}/4)...
                 </div>
               )}
             </div>
           ) : isMyTurn ? (
-            <div className="bg-[#180705] border border-amber-400/60 rounded-xl p-2 flex flex-wrap items-center justify-center gap-2 shadow-xl">
+            <div className="bg-[#180705] border border-amber-400/60 rounded-xl p-1.5 flex items-center justify-center gap-1.5 shadow-xl">
               <button
                 type="button"
                 disabled={multiBusy}
                 onClick={handleMultiHit}
-                className="flex-1 min-w-[100px] py-2 px-3 rounded-lg bg-gradient-to-r from-orange-600 to-red-600 hover:brightness-110 text-white font-black text-xs shadow-md transition-transform active:scale-95 flex items-center justify-center gap-1.5 cursor-pointer border border-orange-400/40 disabled:opacity-40"
+                className="flex-1 py-2 px-3 rounded-lg bg-gradient-to-r from-orange-600 to-red-600 hover:brightness-110 text-white font-black text-xs shadow-md transition-transform active:scale-95 flex items-center justify-center gap-1.5 cursor-pointer border border-orange-400/40 disabled:opacity-40"
               >
                 <Plus className="w-3.5 h-3.5" />
                 <span>Pedir (Hit)</span>
@@ -1618,7 +1644,7 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
                 type="button"
                 disabled={multiBusy}
                 onClick={handleMultiStand}
-                className="flex-1 min-w-[100px] py-2 px-3 rounded-lg bg-[#260e0a] hover:bg-[#34130d] text-orange-200 font-bold text-xs shadow border border-orange-500/30 transition-transform active:scale-95 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40"
+                className="flex-1 py-2 px-3 rounded-lg bg-[#260e0a] hover:bg-[#34130d] text-orange-200 font-bold text-xs shadow border border-orange-500/30 transition-transform active:scale-95 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40"
               >
                 <Hand className="w-3.5 h-3.5" />
                 <span>Parar (Stand)</span>
@@ -1629,14 +1655,14 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
                   type="button"
                   disabled={multiBusy}
                   onClick={handleMultiDoubleDown}
-                  className="flex-1 min-w-[100px] py-2 px-3 rounded-lg bg-gradient-to-r from-amber-500 to-orange-500 hover:brightness-110 text-slate-950 font-black text-xs shadow transition-transform active:scale-95 flex items-center justify-center gap-1.5 cursor-pointer border border-amber-300 disabled:opacity-40"
+                  className="py-2 px-3 rounded-lg bg-gradient-to-r from-amber-500 to-orange-500 hover:brightness-110 text-slate-950 font-black text-xs shadow transition-transform active:scale-95 flex items-center justify-center gap-1 cursor-pointer border border-amber-300 disabled:opacity-40 shrink-0"
                 >
                   <span>2x Dobrar</span>
                 </button>
               )}
             </div>
           ) : (
-            <div className="bg-[#180705] border border-orange-500/30 rounded-xl p-2.5 text-center text-xs text-amber-300 font-semibold">
+            <div className="bg-[#180705] border border-orange-500/30 rounded-xl p-2 text-center text-xs text-amber-300 font-semibold">
               Aguardando jogada de{' '}
               <strong>
                 {(estado?.turnoAtual && activeRoom?.jogadoresInfo?.[estado.turnoAtual]?.nome) || 'outro jogador'}
@@ -1644,45 +1670,6 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
               ...
             </div>
           )}
-        </div>
-
-        {/* Realtime Database: Presence, Dynamic Turn Timer & Live Room Chat */}
-        <RoomChatAndPresence
-          presenceMap={rtdbPresence}
-          chatMessages={rtdbChat}
-          timer={rtdbTimer}
-          myUid={effectiveUid}
-          myReady={myReady}
-          showReadyToggle={multiStatus === 'aguardando' || multiStatus === 'finalizado'}
-          onToggleReady={() => {
-            const next = !myReady;
-            setMyReady(next);
-            void presenceHandleRef.current?.setReady(next);
-          }}
-          onSendMessage={async (msg) => {
-            if (!activeRoomId) return;
-            await sendRoomChatMessage(activeRoomId, playerName, msg, effectiveUid || undefined);
-          }}
-          turnPlayerName={
-            (estado?.turnoAtual && activeRoom?.jogadoresInfo?.[estado.turnoAtual]?.nome) || undefined
-          }
-          isMyTurn={isMyTurn}
-          onTimerExpire={() => {
-            if (isMyTurn && !multiBusy) {
-              void handleMultiStand();
-            }
-          }}
-        />
-
-        <div className="pt-0.5 text-center">
-          <button
-            type="button"
-            onClick={() => setShowHowToPlay(true)}
-            className="inline-flex items-center gap-1 text-[11px] text-orange-300/70 hover:text-amber-300 transition-colors cursor-pointer py-0.5"
-          >
-            <HelpCircle className="w-3 h-3 text-orange-400" />
-            <span>Regras & Como Jogar Blackjack</span>
-          </button>
         </div>
 
         <HowToPlayModal isOpen={showHowToPlay} onClose={() => setShowHowToPlay(false)} gameId="blackjack" />
@@ -1700,7 +1687,7 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
 
   // ---------------- SINGLE-PLAYER VIEW (ORIGINAL LAYOUT & ANIMATIONS PRESERVED) ----------------
   return (
-    <div className="space-y-2 max-w-4xl mx-auto animate-fade-in pb-1">
+    <div className="h-full max-h-full min-h-0 flex flex-col justify-between gap-1.5 overflow-hidden max-w-4xl mx-auto animate-fade-in">
       {/* Top Header Navigation */}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <button
@@ -1719,7 +1706,7 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
       </div>
 
       {/* Blackjack Table Felt */}
-      <div className="casino-felt casino-wood-border rounded-xl p-2.5 sm:p-3 min-h-[175px] sm:min-h-[195px] flex flex-col justify-between relative shadow-xl overflow-hidden">
+      <div className="casino-felt casino-wood-border rounded-xl p-2 sm:p-3 flex-1 min-h-0 flex flex-col justify-between relative shadow-xl overflow-hidden">
         {/* Table Felt Decorative Markings */}
         <div className="absolute inset-x-8 top-1/2 -translate-y-1/2 border border-dashed border-amber-400/10 rounded-full h-32 pointer-events-none flex items-center justify-center">
           <span className="text-amber-400/10 font-cinzel text-lg sm:text-xl font-black uppercase tracking-widest select-none">
