@@ -109,7 +109,7 @@ interface LiarsFirestoreEstado {
   rouletteJustHit: boolean;
   winnerName: string;
   winnerId: string;
-  turnStartedAt: number;
+  turnStartedAt: unknown;
 }
 
 const CHARACTERS: { name: string; type: CharType }[] = [
@@ -121,8 +121,7 @@ const CHARACTERS: { name: string; type: CharType }[] = [
 ];
 
 const LIARS_ROOMS_KEY = 'sapecas_liars_rooms_v1';
-const HUMAN_TURN_MS = 10000; // 10 segundos para o Jogador Humano
-const BOT_TURN_MS = 5000;    // 5 segundos para os Bots
+const TURN_DURATION_MS = 15000; // 15 segundos fixos por turno para todos os jogadores
 
 const SMOKE_PUFFS = [
   { left: '8%', size: 84, dur: '10.5s', delay: '-1.2s', drift: '18px', op: 0.36 },
@@ -348,8 +347,8 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
   const [stagedPotBet, setStagedPotBet] = useState<number>(100);
   const [pressedPotChip, setPressedPotChip] = useState<number | null>(null);
   const [potPressKey, setPotPressKey] = useState<number>(0);
-  const [turnMsLeft, setTurnMsLeft] = useState<number>(HUMAN_TURN_MS);
-  const [turnNonce, setTurnNonce] = useState<number>(0);
+  const [turnMsLeft, setTurnMsLeft] = useState<number>(TURN_DURATION_MS);
+  const [turnStartedAtMs, setTurnStartedAtMs] = useState<number>(() => Date.now());
   const [multiRoundId, setMultiRoundId] = useState<number>(0);
   const [victoryModal, setVictoryModal] = useState<{
     winAmount: number;
@@ -369,6 +368,10 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
   const entryBetRef = useRef(entryBet);
   const multiRoundIdRef = useRef<number>(multiRoundId);
   const syncedTurnStartedAtRef = useRef<number>(Date.now());
+  const serverTimeOffsetRef = useRef<number>(0);
+  const serverOffsetCalibratedRef = useRef<boolean>(false);
+  const pendingServerSyncSentAtRef = useRef<number | null>(null);
+  const lastConfirmedTurnStartMsRef = useRef<number | null>(null);
   const prevRoulettePhaseRef = useRef<RoulettePhase>('IDLE');
   const chargedMatchRoundRef = useRef<number>(0);
   const settledMatchRoundRef = useRef<number>(0);
@@ -412,6 +415,27 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
     };
   };
 
+  const extractTimestampMs = (val: unknown): number | null => {
+    if (val && typeof val === 'object') {
+      if ('toMillis' in val && typeof (val as { toMillis?: unknown }).toMillis === 'function') {
+        const ms = (val as { toMillis: () => number }).toMillis();
+        return Number.isFinite(ms) ? ms : null;
+      }
+      if ('seconds' in val && typeof (val as { seconds?: unknown }).seconds === 'number') {
+        const secs = (val as { seconds: number }).seconds;
+        const nanos =
+          'nanoseconds' in val && typeof (val as { nanoseconds?: unknown }).nanoseconds === 'number'
+            ? (val as { nanoseconds: number }).nanoseconds
+            : 0;
+        return secs * 1000 + Math.floor(nanos / 1e6);
+      }
+    }
+    if (typeof val === 'number' && Number.isFinite(val)) {
+      return val;
+    }
+    return null;
+  };
+
   const writeFullEstadoToFirestore = async (
     roomId: string,
     estado: LiarsFirestoreEstado
@@ -436,8 +460,9 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
         rouletteJustHit: Boolean(estado.rouletteJustHit),
         winnerName: estado.winnerName || '',
         winnerId: estado.winnerId || '',
-        turnStartedAt: estado.turnStartedAt || Date.now()
+        turnStartedAt: estado.turnStartedAt ?? serverTimestamp()
       };
+      pendingServerSyncSentAtRef.current = Date.now();
       await updateDoc(doc(db, 'salas', roomId), {
         status: cleanEstado.status,
         estadoJogo: cleanEstado,
@@ -474,6 +499,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
               : v;
         }
       }
+      pendingServerSyncSentAtRef.current = Date.now();
       await updateDoc(doc(db, 'salas', roomId), updatePayload);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -581,7 +607,20 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
           showToast('A taverna foi encerrada.');
           return;
         }
-        const data = docSnap.data() as Record<string, unknown>;
+        const data = docSnap.data({ serverTimestamps: 'estimate' }) as Record<string, unknown>;
+        const hasPendingWrites = docSnap.metadata.hasPendingWrites;
+
+        // Calibrate client-to-Firestore server clock offset when our write commits
+        if (!hasPendingWrites && pendingServerSyncSentAtRef.current !== null) {
+          const serverUpdatedMs = extractTimestampMs(data.atualizadoEm);
+          if (serverUpdatedMs !== null) {
+            const approxLocalAtWrite = (pendingServerSyncSentAtRef.current + Date.now()) / 2;
+            serverTimeOffsetRef.current = serverUpdatedMs - approxLocalAtWrite;
+            serverOffsetCalibratedRef.current = true;
+          }
+          pendingServerSyncSentAtRef.current = null;
+        }
+
         const jogadores = Array.isArray(data.jogadores) ? (data.jogadores as string[]) : [];
         const infoMap = (data.jogadoresInfo && typeof data.jogadoresInfo === 'object'
           ? data.jogadoresInfo
@@ -651,6 +690,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
             })
           ];
           playersRef.current = seated;
+          lastConfirmedTurnStartMsRef.current = null;
           setPlayers(seated);
           setGameState('WAITING');
           prevRoulettePhaseRef.current = 'IDLE';
@@ -671,13 +711,25 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
         const syncedLastPlay = estado.lastPlay ?? null;
         const syncedRoundId = typeof estado.roundId === 'number' ? estado.roundId : 1;
         const syncedRoulettePhase: RoulettePhase = estado.roulettePhase || 'IDLE';
-        const syncedTurnStarted = typeof estado.turnStartedAt === 'number' ? estado.turnStartedAt : Date.now();
+
+        const rawTurnStartMs = extractTimestampMs(estado.turnStartedAt);
+        let resolvedTurnStartMs = syncedTurnStartedAtRef.current;
+        if (hasPendingWrites) {
+          if (rawTurnStartMs !== lastConfirmedTurnStartMsRef.current) {
+            resolvedTurnStartMs = Date.now() + serverTimeOffsetRef.current;
+          }
+        } else if (rawTurnStartMs !== null) {
+          lastConfirmedTurnStartMsRef.current = rawTurnStartMs;
+          resolvedTurnStartMs = rawTurnStartMs;
+        } else if (lastConfirmedTurnStartMsRef.current === null) {
+          resolvedTurnStartMs = Date.now() + serverTimeOffsetRef.current;
+        }
 
         playersRef.current = syncedPlayers;
         lastPlayRef.current = syncedLastPlay;
         tableTargetRef.current = syncedTarget;
         potAmountRef.current = syncedPot;
-        syncedTurnStartedAtRef.current = syncedTurnStarted;
+        syncedTurnStartedAtRef.current = resolvedTurnStartMs;
 
         setPlayers(syncedPlayers);
         setTableTarget(syncedTarget);
@@ -686,6 +738,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
         setEntryBet(syncedEntry);
         setLastPlay(syncedLastPlay);
         setMultiRoundId(syncedRoundId);
+        setTurnStartedAtMs(resolvedTurnStartMs);
 
         if (fsPhase !== 'REVEAL' && typeof estado.revealedTableCount === 'number') {
           setRevealedTableCount(estado.revealedTableCount);
@@ -715,7 +768,6 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
 
         setGameState(fsPhase);
         setSelectedCardIds([]);
-        setTurnNonce((n) => n + 1);
 
         // Deduct entry bet once per roundId for every seated Firebase player
         if (
@@ -812,6 +864,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
     if (effectiveUid) {
       const cleanRoomName = newRoomName.trim().slice(0, 60);
       try {
+        pendingServerSyncSentAtRef.current = Date.now();
         const docRef = await addDoc(collection(db, 'salas'), {
           nome: cleanRoomName,
           jogo: 'liars-bar',
@@ -893,6 +946,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
           return;
         }
         try {
+          pendingServerSyncSentAtRef.current = Date.now();
           await updateDoc(doc(db, 'salas', room.id), {
             jogadores: arrayUnion(effectiveUid),
             [`jogadoresInfo.${effectiveUid}`]: {
@@ -911,6 +965,11 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
           showToast('Erro ao entrar na sala.');
           return;
         }
+      } else if (!serverOffsetCalibratedRef.current) {
+        pendingServerSyncSentAtRef.current = Date.now();
+        void updateDoc(doc(db, 'salas', room.id), {
+          atualizadoEm: serverTimestamp()
+        }).catch(() => {});
       }
       setActiveRoom(room);
       setGameState('WAITING');
@@ -978,6 +1037,8 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
     clearAllTimers();
     chargedMatchRoundRef.current = 0;
     settledMatchRoundRef.current = 0;
+    lastConfirmedTurnStartMsRef.current = null;
+    pendingServerSyncSentAtRef.current = null;
     setPlayers([]);
     setLastPlay(null);
     setMultiRoundId(0);
@@ -1076,7 +1137,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
         rouletteJustHit: false,
         winnerName: '',
         winnerId: '',
-        turnStartedAt: Date.now()
+        turnStartedAt: serverTimestamp()
       };
       void writeFullEstadoToFirestore(activeRoom.id, initialEstado);
       return;
@@ -1217,32 +1278,33 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
           roulettePhase: 'IDLE',
           rouletteJustHit: false,
           rouletteVictimIdx: null,
-          turnStartedAt: Date.now()
+          turnStartedAt: serverTimestamp()
         },
         'jogando'
       );
       return;
     }
 
+    const now = Date.now();
     setTableTarget(chosenTarget);
     playersRef.current = updatedPlayers;
     lastPlayRef.current = null;
     tableTargetRef.current = chosenTarget;
-    syncedTurnStartedAtRef.current = Date.now();
+    syncedTurnStartedAtRef.current = now;
+    setTurnStartedAtMs(now);
     setPlayers(updatedPlayers);
     setCurrentTurnIdx(safeIdx);
     setLastPlay(null);
     setSelectedCardIds([]);
     setRevealedTableCount(0);
-    setTurnMsLeft(updatedPlayers[safeIdx]?.isBot ? BOT_TURN_MS : HUMAN_TURN_MS);
-    setTurnNonce((n) => n + 1);
+    setTurnMsLeft(TURN_DURATION_MS);
 
     if (updatedPlayers[safeIdx]?.isBot && !updatedPlayers[safeIdx]?.isEliminated) {
       botActionTimerRef.current = window.setTimeout(() => botTurn(safeIdx), 2000);
     }
   };
 
-  // Aumentar aposta no pote (também reinicia o timer de 10s do jogador)
+  // Aumentar aposta no pote (também reinicia o timer de 15s do jogador)
   const handleRaisePot = (amt = 100) => {
     if (gameState !== 'PLAYING' || !isHumanTurn || isHumanEliminated) return;
     if (balance < amt) {
@@ -1256,14 +1318,15 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
     if (activeRoom?.isFirestore) {
       void patchFirestoreEstado(activeRoom.id, {
         potAmount: nextPot,
-        turnStartedAt: Date.now()
+        turnStartedAt: serverTimestamp()
       });
     } else {
-      syncedTurnStartedAtRef.current = Date.now();
-      setTurnMsLeft(HUMAN_TURN_MS);
-      setTurnNonce((n) => n + 1);
+      const now = Date.now();
+      syncedTurnStartedAtRef.current = now;
+      setTurnStartedAtMs(now);
+      setTurnMsLeft(TURN_DURATION_MS);
     }
-    showToast(`🪙 Aposta de ${amt} fichas adicionada ao pote! Timer reiniciado (10s).`);
+    showToast(`🪙 Aposta de ${amt} fichas adicionada ao pote! Timer reiniciado (15s).`);
   };
 
   // Human player plays cards (Declarar)
@@ -1296,8 +1359,13 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
     advanceTurn(currentTurnIdx, updatedPlayers, nextPlay);
   };
 
-  // Advance turn to next alive player & restart timer (10s Human / 5s Bot)
-  const advanceTurn = (fromIdx: number, currentPlayers: Player[], overrideLastPlay?: LastPlayState | null) => {
+  // Advance turn to next alive player & restart unified 15s timer
+  const advanceTurn = (
+    fromIdx: number,
+    currentPlayers: Player[],
+    overrideLastPlay?: LastPlayState | null,
+    overridePotAmount?: number
+  ) => {
     if (botActionTimerRef.current) {
       window.clearTimeout(botActionTimerRef.current);
       botActionTimerRef.current = null;
@@ -1310,21 +1378,26 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
     }
 
     if (activeRoom?.isFirestore) {
-      void patchFirestoreEstado(activeRoom.id, {
+      const payload: Record<string, unknown> = {
         players: currentPlayers,
         lastPlay: overrideLastPlay !== undefined ? overrideLastPlay : lastPlayRef.current,
         currentTurnIdx: nextIdx,
-        turnStartedAt: Date.now()
-      });
+        turnStartedAt: serverTimestamp()
+      };
+      if (typeof overridePotAmount === 'number') {
+        payload.potAmount = overridePotAmount;
+      }
+      void patchFirestoreEstado(activeRoom.id, payload);
       return;
     }
 
-    syncedTurnStartedAtRef.current = Date.now();
+    const now = Date.now();
+    syncedTurnStartedAtRef.current = now;
+    setTurnStartedAtMs(now);
     setCurrentTurnIdx(nextIdx);
-    setTurnMsLeft(currentPlayers[nextIdx]?.isBot ? BOT_TURN_MS : HUMAN_TURN_MS);
-    setTurnNonce((n) => n + 1);
+    setTurnMsLeft(TURN_DURATION_MS);
 
-    // If next player is bot, trigger bot logic within the 5s window
+    // If next player is bot, trigger bot logic within the 15s window
     if (currentPlayers[nextIdx].isBot && !currentPlayers[nextIdx].isEliminated && currentPlayers[nextIdx].lives > 0) {
       botActionTimerRef.current = window.setTimeout(() => botTurn(nextIdx), 2000);
     }
@@ -1420,7 +1493,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
         roulettePhase: 'IDLE',
         rouletteJustHit: false,
         rouletteMessage: msg,
-        turnStartedAt: Date.now()
+        turnStartedAt: serverTimestamp()
       });
       return;
     }
@@ -1442,14 +1515,15 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
 
     const tReveal = window.setTimeout(() => {
       if (!victim) return;
-      syncedTurnStartedAtRef.current = Date.now();
+      const now = Date.now();
+      syncedTurnStartedAtRef.current = now;
+      setTurnStartedAtMs(now);
       setRouletteVictimIdx(loserIdx);
       setRouletteChambers(victim.chambersRemaining || 3);
       setRoulettePhase('IDLE');
       setRouletteJustHit(false);
       setRouletteMessage(msg);
-      setTurnMsLeft(victim.isBot ? BOT_TURN_MS : HUMAN_TURN_MS);
-      setTurnNonce((n) => n + 1);
+      setTurnMsLeft(TURN_DURATION_MS);
       setGameState('ROULETTE');
 
       if (victim.isBot) {
@@ -1662,13 +1736,6 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
     )
   );
 
-  // Active turn duration: 10s when human acts, 5s when bot acts
-  const activeTurnIsBot =
-    gameState === 'ROULETTE'
-      ? rouletteVictimIdx !== null && Boolean(players[rouletteVictimIdx]?.isBot)
-      : Boolean(players[currentTurnIdx]?.isBot);
-  const activeTurnDurationMs = activeTurnIsBot ? BOT_TURN_MS : HUMAN_TURN_MS;
-
   // Host-only Firestore automation for bot turns, REVEAL progression, and bot roulette
   useEffect(() => {
     if (!isFirestoreRoom || !isLiarsRoomHost || !activeRoom?.id) return;
@@ -1680,7 +1747,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
       botTurn(currentTurnIdx);
     }, 1800);
     return () => window.clearTimeout(t);
-  }, [isFirestoreRoom, isLiarsRoomHost, activeRoom?.id, gameState, currentTurnIdx, turnNonce]);
+  }, [isFirestoreRoom, isLiarsRoomHost, activeRoom?.id, gameState, currentTurnIdx, turnStartedAtMs]);
 
   useEffect(() => {
     if (!isFirestoreRoom || gameState !== 'REVEAL' || !lastPlay || !activeRoom?.id) return;
@@ -1702,7 +1769,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
           phase: 'ROULETTE',
           roulettePhase: 'IDLE',
           rouletteJustHit: false,
-          turnStartedAt: Date.now()
+          turnStartedAt: serverTimestamp()
         });
       }, revealWaitMs);
       timers.push(tEnd);
@@ -1775,15 +1842,17 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
         setPlayers(updatedPlayers);
         setLastPlay(nextPlay);
         setSelectedCardIds([]);
-        if (activeRoom?.isFirestore && minBet > 0) {
-          void patchFirestoreEstado(activeRoom.id, { potAmount: nextPot });
-        }
         showToast(
           minBet > 0
             ? `⏱️ Tempo esgotado! Aposta mínima automática (+${minBet}) e 1 carta declarada.`
             : '⏱️ Tempo esgotado! 1 carta declarada automaticamente.'
         );
-        advanceTurn(currentTurnIdx, updatedPlayers, nextPlay);
+        advanceTurn(
+          currentTurnIdx,
+          updatedPlayers,
+          nextPlay,
+          activeRoom?.isFirestore && minBet > 0 ? nextPot : undefined
+        );
       } else if (lastPlayRef.current && lastPlayRef.current.playerIdx !== currentTurnIdx) {
         showToast('⏱️ Tempo esgotado! Desafio automático!');
         handleChallenge(currentTurnIdx);
@@ -1791,28 +1860,36 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
     }
   };
 
-  // Countdown engine (10s Human / 5s Bots; active only during PLAYING or unspun ROULETTE)
+  // Countdown engine (15s unified for ALL players; active only during PLAYING or unspun ROULETTE)
   useEffect(() => {
     const isTimerActive =
       gameState === 'PLAYING' || (gameState === 'ROULETTE' && roulettePhase === 'IDLE' && !rouletteSpinning);
     if (!isTimerActive) return;
 
-    const totalMs =
-      gameState === 'ROULETTE'
-        ? rouletteVictimIdx !== null && players[rouletteVictimIdx]?.isBot
-          ? BOT_TURN_MS
-          : HUMAN_TURN_MS
-        : players[currentTurnIdx]?.isBot
-        ? BOT_TURN_MS
-        : HUMAN_TURN_MS;
+    const totalMs = TURN_DURATION_MS;
+    const startAt = turnStartedAtMs;
+    const getServerNow = () => (isFirestoreRoom ? Date.now() + serverTimeOffsetRef.current : Date.now());
+    const calcRemaining = () => {
+      const elapsed = Math.max(0, getServerNow() - startAt);
+      return Math.max(0, totalMs - elapsed);
+    };
 
-    const startAt = isFirestoreRoom ? syncedTurnStartedAtRef.current : Date.now();
-    setTurnMsLeft(Math.max(0, totalMs - (Date.now() - startAt)));
+    const initialRemaining = calcRemaining();
+    setTurnMsLeft(initialRemaining);
     let firedTimeout = false;
 
+    if (initialRemaining <= 0) {
+      const tZero = window.setTimeout(() => {
+        if (!firedTimeout) {
+          firedTimeout = true;
+          autoTimeoutHandlerRef.current();
+        }
+      }, 0);
+      return () => window.clearTimeout(tZero);
+    }
+
     const iv = window.setInterval(() => {
-      const elapsed = Date.now() - startAt;
-      const remaining = Math.max(0, totalMs - elapsed);
+      const remaining = calcRemaining();
       setTurnMsLeft(remaining);
       if (remaining <= 0 && !firedTimeout) {
         firedTimeout = true;
@@ -1822,11 +1899,11 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
     }, 100);
 
     return () => window.clearInterval(iv);
-  }, [gameState, currentTurnIdx, rouletteVictimIdx, roulettePhase, rouletteSpinning, turnNonce, isFirestoreRoom]);
+  }, [gameState, currentTurnIdx, rouletteVictimIdx, roulettePhase, rouletteSpinning, turnStartedAtMs, isFirestoreRoom]);
 
-  const turnSecondsCeil = Math.ceil(turnMsLeft / 1000);
-  const turnPct = Math.max(0, Math.min(100, (turnMsLeft / activeTurnDurationMs) * 100));
-  const timerUrgent = turnSecondsCeil <= 2;
+  const turnSecondsCeil = Math.min(15, Math.max(0, Math.ceil(turnMsLeft / 1000)));
+  const turnPct = Math.max(0, Math.min(100, (turnMsLeft / TURN_DURATION_MS) * 100));
+  const timerUrgent = turnSecondsCeil <= 3;
 
   // Keep all opponents (both active and eliminated spectators) seated at the table until match end
   const tableOpponents = players.filter((p) => p.id !== humanPlayer?.id);
@@ -2430,7 +2507,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
             {players[rouletteVictimIdx!]?.name} enfrenta o revólver!
           </h2>
 
-          {/* Victim Character (exact current wounds: 0 initially, 1 only after 1st bullet, 2 on 2nd) + 3-Chamber Revolver Cylinder + 5s Timer */}
+          {/* Victim Character (exact current wounds: 0 initially, 1 only after 1st bullet, 2 on 2nd) + 3-Chamber Revolver Cylinder + 15s Timer */}
           <div className="relative z-10 flex items-center justify-center gap-4 sm:gap-6 my-1">
             <div className="flex flex-col items-center">
               {renderCharacterAvatar(
@@ -2505,7 +2582,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
                 </svg>
                 <div className="absolute -top-1 w-0 h-0 border-l-[7px] border-l-transparent border-r-[7px] border-r-transparent border-t-[13px] border-t-red-500" />
               </div>
-              {/* 5s Roulette Timer right next to avatar & gun */}
+              {/* 15s Roulette Timer right next to avatar & gun */}
               <div className="w-28 mt-1">
                 <div className="flex justify-between text-[10px] font-black mb-0.5">
                   <span className="text-amber-300">GATILHO</span>
