@@ -1,21 +1,98 @@
-import React, { useState } from 'react';
-import { ArrowLeft, Trophy, History, Users, Activity, Sparkles, ShieldCheck } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { ArrowLeft, Trophy, History, Activity, ShieldCheck, Loader2 } from 'lucide-react';
+import { collection, onSnapshot } from 'firebase/firestore';
+import { auth, db, handleFirestoreError, OperationType } from '../firebase';
 import { UserAccount } from '../types/casino';
 import { getStoredAccounts, getRealCommunityFeed } from '../utils/auth';
 
 interface RankingsViewProps {
   currentUser: UserAccount | null;
+  firebaseUid?: string | null;
   onBackToLobby: () => void;
+}
+
+interface RankingEntry {
+  uid?: string;
+  username: string;
+  avatar?: string;
+  balance: number;
+  totalWins: number;
+  totalLosses: number;
+  biggestWin: number;
+  lastLogin: number;
 }
 
 export const RankingsView: React.FC<RankingsViewProps> = ({
   currentUser,
+  firebaseUid,
   onBackToLobby
 }) => {
   const [activeTab, setActiveTab] = useState<'LEADERBOARD' | 'COMMUNITY' | 'HISTORY'>('LEADERBOARD');
   const [sortBy, setSortBy] = useState<'BALANCE' | 'WINS'>('BALANCE');
+  const [firestorePlayers, setFirestorePlayers] = useState<RankingEntry[]>([]);
+  const [loadingRanking, setLoadingRanking] = useState<boolean>(false);
 
-  const accounts = getStoredAccounts();
+  const effectiveUid = firebaseUid || auth.currentUser?.uid || null;
+
+  useEffect(() => {
+    if (!effectiveUid) {
+      setFirestorePlayers([]);
+      setLoadingRanking(false);
+      return;
+    }
+
+    setLoadingRanking(true);
+    const unsub = onSnapshot(
+      collection(db, 'usuarios'),
+      (snapshot) => {
+        const list: RankingEntry[] = [];
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data() as Record<string, unknown>;
+          const ts = data.atualizadoEm || data.criadoEm;
+          const lastLoginMs =
+            ts && typeof ts === 'object' && 'toMillis' in ts
+              ? (ts as { toMillis: () => number }).toMillis()
+              : Date.now();
+          list.push({
+            uid: String(data.uid || docSnap.id),
+            username: String(data.nome || data.nomeUsuario || 'Jogador'),
+            avatar: typeof data.avatar === 'string' ? data.avatar : undefined,
+            balance:
+              typeof data.saldo === 'number'
+                ? data.saldo
+                : typeof data.saldoFichas === 'number'
+                ? data.saldoFichas
+                : 0,
+            totalWins: typeof data.totalVitorias === 'number' ? data.totalVitorias : 0,
+            totalLosses: typeof data.totalDerrotas === 'number' ? data.totalDerrotas : 0,
+            biggestWin: typeof data.maiorVitoria === 'number' ? data.maiorVitoria : 0,
+            lastLogin: lastLoginMs
+          });
+        });
+        setFirestorePlayers(list);
+        setLoadingRanking(false);
+      },
+      (error) => {
+        setLoadingRanking(false);
+        handleFirestoreError(error, OperationType.LIST, 'usuarios');
+      }
+    );
+
+    return () => unsub();
+  }, [effectiveUid]);
+
+  const localAccounts = getStoredAccounts().map((a) => ({
+    uid: a.uid,
+    username: a.nickname || a.username,
+    avatar: a.avatar,
+    balance: a.balance,
+    totalWins: a.totalWins,
+    totalLosses: a.totalLosses,
+    biggestWin: a.biggestWin,
+    lastLogin: a.lastLogin
+  }));
+
+  const accounts: RankingEntry[] = effectiveUid && firestorePlayers.length > 0 ? firestorePlayers : localAccounts;
   const communityFeed = getRealCommunityFeed();
 
   // Sort players
@@ -81,7 +158,7 @@ export const RankingsView: React.FC<RankingsViewProps> = ({
           <div className="flex items-center justify-between bg-[#1f0906] border border-orange-500/20 px-3 py-1.5 rounded-xl text-[11px] text-orange-200">
             <div className="flex items-center gap-1.5">
               <ShieldCheck className="w-4 h-4 text-emerald-400" />
-              <span>Rankings oficiais 100% de <strong>usuários reais cadastrados</strong> (zero bots ou nomes fictícios).</span>
+              <span>Rankings oficiais em tempo real de <strong>usuários reais cadastrados no Firestore</strong>.</span>
             </div>
             <span className="text-orange-400 font-mono text-[10px]">
               {accounts.length} {accounts.length === 1 ? 'jogador cadastrado' : 'jogadores cadastrados'}
@@ -124,7 +201,12 @@ export const RankingsView: React.FC<RankingsViewProps> = ({
 
           {/* Players Table */}
           <div className="bg-[#140503] border border-orange-500/30 rounded-xl overflow-hidden shadow-2xl">
-            {sortedPlayers.length === 0 ? (
+            {loadingRanking && sortedPlayers.length === 0 ? (
+              <div className="py-12 text-center text-xs text-orange-300/70 flex items-center justify-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
+                <span>Carregando ranking de jogadores cadastrados...</span>
+              </div>
+            ) : sortedPlayers.length === 0 ? (
               <div className="py-12 text-center text-xs text-orange-300/70">
                 Nenhum jogador cadastrado encontrado. Crie uma conta para ser o #1!
               </div>
@@ -143,12 +225,14 @@ export const RankingsView: React.FC<RankingsViewProps> = ({
                   </thead>
                   <tbody className="divide-y divide-orange-500/15">
                     {sortedPlayers.map((player, idx) => {
-                      const isMe = currentUser?.username.toLowerCase() === player.username.toLowerCase();
+                      const isMe = effectiveUid && player.uid
+                        ? player.uid === effectiveUid
+                        : currentUser?.username.toLowerCase() === player.username.toLowerCase();
                       const rank = idx + 1;
 
                       return (
                         <tr
-                          key={player.username}
+                          key={player.uid || `${player.username}-${idx}`}
                           className={`transition-colors ${
                             isMe
                               ? 'bg-amber-500/15 font-semibold text-amber-200'
@@ -179,8 +263,8 @@ export const RankingsView: React.FC<RankingsViewProps> = ({
                           {/* Username */}
                           <td className="py-2.5 px-3">
                             <div className="flex items-center gap-2">
-                              <div className="w-6 h-6 rounded-lg bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center text-[10px] font-black text-white shadow">
-                                {player.username.charAt(0).toUpperCase()}
+                              <div className="w-6 h-6 rounded-lg bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center text-[11px] font-black text-white shadow">
+                                {player.avatar || player.username.charAt(0).toUpperCase()}
                               </div>
                               <span className="font-bold text-orange-100">
                                 {player.username} {isMe && <span className="text-[10px] text-amber-400 font-normal">(Você)</span>}

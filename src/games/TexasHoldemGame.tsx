@@ -85,6 +85,7 @@ interface TablePlayer {
   uid?: string;
   username: string;
   chips: number;
+  startingChips?: number;
   holeCards: Card[];
   currentStreetBet: number;
   totalRoundBet: number;
@@ -158,6 +159,10 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
   const [peekHoleCards, setPeekHoleCards] = useState<boolean>(false);
   const [multiRaiseAmount, setMultiRaiseAmount] = useState<number>(100);
   const [multiWinnerMsg, setMultiWinnerMsg] = useState<string>('');
+  const [multiRoundId, setMultiRoundId] = useState<number>(0);
+  const [hideMyHoleCards, setHideMyHoleCards] = useState<boolean>(false);
+  const [showAddLocalPlayer, setShowAddLocalPlayer] = useState<boolean>(false);
+  const [showChatDrawer, setShowChatDrawer] = useState<boolean>(false);
   const [selectedUserToJoin, setSelectedUserToJoin] = useState<string>('');
   const [rtdbPresence, setRtdbPresence] = useState<Record<string, PlayerPresence>>({});
   const [rtdbChat, setRtdbChat] = useState<RoomChatMessage[]>([]);
@@ -165,12 +170,24 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
   const [rtdbEstadoLive, setRtdbEstadoLive] = useState<RtdbEstadoJogo | null>(null);
   const [myReady, setMyReady] = useState<boolean>(false);
   const presenceHandleRef = useRef<{ setReady: (pronto: boolean) => Promise<void>; disconnect: () => Promise<void> } | null>(null);
+  const lastSettledRoundRef = useRef<number>(0);
+  const onUpdateBalanceRef = useRef(onUpdateBalance);
+
+  useEffect(() => {
+    onUpdateBalanceRef.current = onUpdateBalance;
+  }, [onUpdateBalance]);
 
   const pokerUser = currentUser || getCurrentUser();
   const effectiveUid = firebaseUid || auth.currentUser?.uid || null;
   const pokerUid = effectiveUid || pokerUser?.uid || pokerUser?.username || 'jogador';
   const pokerPlayerName = (pokerUser?.nickname || pokerUser?.username || auth.currentUser?.displayName || 'Jogador').slice(0, 32);
   const pokerAvatar = (pokerUser?.avatar || '🦁').slice(0, 16);
+  const isFirestoreRoom = Boolean(activeRoom?.isFirestore);
+  const isRoomHost = !isFirestoreRoom || (Boolean(effectiveUid) && activeRoom?.criadorId === effectiveUid);
+  const currentTurnPlayer = tablePlayers[activePlayerIndex];
+  const isMyTurn =
+    !isFirestoreRoom ||
+    (Boolean(effectiveUid) && currentTurnPlayer?.uid === effectiveUid);
 
   useEffect(() => {
     if (gameMode !== 'MULTIPLAYER' || !activeRoom?.id || !auth.currentUser?.uid) {
@@ -297,15 +314,21 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
         );
 
         const stage = (estado.stage as typeof multiStage) || 'WAITING';
+        const incomingRoundId = typeof estado.roundId === 'number' ? estado.roundId : 0;
+        const incomingPot = typeof estado.pot === 'number' ? estado.pot : 0;
+        const incomingPlayers = Array.isArray(estado.players) ? (estado.players as TablePlayer[]) : [];
+        const incomingWinnerMsg = typeof estado.winnerMsg === 'string' ? estado.winnerMsg : '';
+
         setMultiStage(stage);
-        setMultiPot(typeof estado.pot === 'number' ? estado.pot : 0);
+        setMultiRoundId(incomingRoundId);
+        setMultiPot(incomingPot);
         setCurrentHighestBet(typeof estado.highestBet === 'number' ? estado.highestBet : 0);
         setActivePlayerIndex(typeof estado.activePlayerIndex === 'number' ? estado.activePlayerIndex : 0);
         setMultiRevealedCount(typeof estado.revealedCount === 'number' ? estado.revealedCount : 0);
         setMultiCommunityCards(Array.isArray(estado.communityCards) ? (estado.communityCards as Card[]) : []);
-        setMultiWinnerMsg(typeof estado.winnerMsg === 'string' ? estado.winnerMsg : '');
+        setMultiWinnerMsg(incomingWinnerMsg);
 
-        if (stage === 'WAITING' || !Array.isArray(estado.players) || (estado.players as unknown[]).length === 0) {
+        if (stage === 'WAITING' || incomingPlayers.length === 0) {
           const syncedSeated: TablePlayer[] = jogadores.map((uid, idx) => {
             const meta = infoMap[uid];
             return {
@@ -322,7 +345,24 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
           });
           setTablePlayers(syncedSeated);
         } else {
-          setTablePlayers(estado.players as TablePlayer[]);
+          setTablePlayers(incomingPlayers);
+
+          if (stage === 'SHOWDOWN' && incomingRoundId > 0 && lastSettledRoundRef.current !== incomingRoundId) {
+            lastSettledRoundRef.current = incomingRoundId;
+            const mySeat = incomingPlayers.find((p) => p.uid === effectiveUid);
+            if (mySeat && typeof mySeat.startingChips === 'number') {
+              const netDelta = mySeat.chips - mySeat.startingChips;
+              if (netDelta !== 0) {
+                onUpdateBalanceRef.current(netDelta, netDelta > 0, 'texas-holdem', mySeat.totalRoundBet || 0);
+              }
+            }
+            const winnerSubtitle = typeof estado.winnerSubtitle === 'string'
+              ? estado.winnerSubtitle
+              : incomingWinnerMsg || 'Fim da Rodada';
+            if (incomingPot > 0) {
+              scheduleVictoryModal(incomingPot, "TEXAS HOLD'EM MULTIPLAYER", winnerSubtitle, 550);
+            }
+          }
         }
       },
       (error) => {
@@ -362,17 +402,46 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     localStorage.setItem(ROOMS_KEY, JSON.stringify(newRooms));
   };
 
+  const sanitizePlayersForFirestore = (players: TablePlayer[]): Record<string, unknown>[] =>
+    players.map((p) => {
+      const clean: Record<string, unknown> = {
+        uid: p.uid || '',
+        username: p.username,
+        chips: p.chips,
+        holeCards: p.holeCards || [],
+        currentStreetBet: p.currentStreetBet || 0,
+        totalRoundBet: p.totalRoundBet || 0,
+        folded: Boolean(p.folded),
+        isAllIn: Boolean(p.isAllIn),
+        isDealer: Boolean(p.isDealer),
+        ...(typeof p.startingChips === 'number' ? { startingChips: p.startingChips } : {})
+      };
+      if (p.handResult) {
+        clean.handResult = {
+          tier: p.handResult.tier,
+          name: p.handResult.name,
+          kickers: p.handResult.kickers,
+          bestCards: p.handResult.bestCards
+        };
+      }
+      return clean;
+    });
+
   const syncPokerEstadoToFirestore = async (
     roomId: string,
     roomStatus: 'aguardando' | 'jogando' | 'finalizado',
     estadoPayload: Record<string, unknown>
   ) => {
     try {
+      const payloadCopy = { ...estadoPayload };
+      if (Array.isArray(payloadCopy.players)) {
+        payloadCopy.players = sanitizePlayersForFirestore(payloadCopy.players as TablePlayer[]);
+      }
       await updateDoc(doc(db, 'salas', roomId), {
         status: roomStatus,
         estadoJogo: {
           status: roomStatus,
-          ...estadoPayload
+          ...payloadCopy
         },
         atualizadoEm: serverTimestamp()
       });
@@ -380,6 +449,8 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
       const msg = error instanceof Error ? error.message : String(error);
       if (msg.toLowerCase().includes('permission') || msg.toLowerCase().includes('insufficient')) {
         handleFirestoreError(error, OperationType.UPDATE, `salas/${roomId}`);
+      } else {
+        console.error('Erro ao sincronizar estado do Poker:', error);
       }
     }
   };
@@ -421,12 +492,13 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
           estadoJogo: {
             status: 'aguardando',
             stage: 'WAITING',
+            roundId: 0,
             pot: 0,
             highestBet: 0,
             activePlayerIndex: 0,
             communityCards: [],
             revealedCount: 0,
-            players: [initialPlayer],
+            players: sanitizePlayersForFirestore([initialPlayer]),
             winnerMsg: ''
           },
           criadoEm: serverTimestamp(),
@@ -574,6 +646,10 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     setActiveRoom(null);
     setTablePlayers([]);
     setMultiStage('WAITING');
+    setMultiRoundId(0);
+    setShowChatDrawer(false);
+    setShowAddLocalPlayer(false);
+    lastSettledRoundRef.current = 0;
   };
 
   const handleAddPlayerToRoom = () => {
@@ -624,36 +700,48 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
   };
 
   const startNewMultiplayerHand = () => {
+    if (isFirestoreRoom && !isRoomHost) {
+      showToast('Apenas o criador (anfitrião) da sala pode iniciar e embaralhar a mão!');
+      return;
+    }
     if (tablePlayers.length < 2) {
       showToast('São necessários pelo menos 2 jogadores para iniciar a mão!');
       return;
     }
 
+    if (victoryTimerRef.current) window.clearTimeout(victoryTimerRef.current);
+    setVictoryModal(null);
     soundManager.playShuffle();
     const newDeck = shuffleDeck(createDeck());
     const bigBlind = 50;
     const smallBlind = 25;
+    const nextRoundId = multiRoundId + 1;
 
     let pot = 0;
-    const updated = tablePlayers.map((p, idx) => {
+    const updated: TablePlayer[] = tablePlayers.map((p, idx) => {
       const c1 = newDeck.pop()!;
       const c2 = newDeck.pop()!;
+      const baseChips = p.uid === effectiveUid && isFirestoreRoom
+        ? Math.max(100, balance)
+        : Math.max(100, p.chips);
       let blind = 0;
 
-      if (idx === 0) blind = Math.min(p.chips, smallBlind);
-      else if (idx === 1) blind = Math.min(p.chips, bigBlind);
+      if (idx === 0) blind = Math.min(baseChips, smallBlind);
+      else if (idx === 1) blind = Math.min(baseChips, bigBlind);
 
       pot += blind;
 
       return {
-        ...p,
-        chips: p.chips - blind,
+        uid: p.uid,
+        username: p.username,
+        chips: baseChips - blind,
+        startingChips: baseChips,
         holeCards: [c1, c2],
         currentStreetBet: blind,
         totalRoundBet: blind,
         folded: false,
-        isAllIn: p.chips <= blind,
-        handResult: undefined
+        isAllIn: baseChips <= blind,
+        isDealer: idx === 0
       };
     });
 
@@ -673,14 +761,17 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     const nextTurnIdx = updated.length > 2 ? 2 : 0;
     setActivePlayerIndex(nextTurnIdx);
     setMultiStage('PREFLOP');
+    setMultiRoundId(nextRoundId);
     setMultiWinnerMsg('');
     setPeekHoleCards(false);
+    setHideMyHoleCards(false);
     setMultiRaiseAmount(bigBlind * 2);
     soundManager.playCardDeal();
 
     if (activeRoom?.isFirestore) {
       void syncPokerEstadoToFirestore(activeRoom.id, 'jogando', {
         stage: 'PREFLOP',
+        roundId: nextRoundId,
         pot,
         highestBet: bigBlind,
         activePlayerIndex: nextTurnIdx,
@@ -704,6 +795,11 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
   };
 
   const handleMultiFold = () => {
+    if (multiStage === 'WAITING' || multiStage === 'SHOWDOWN') return;
+    if (!isMyTurn) {
+      showToast(`Aguarde! Agora é a vez de ${currentTurnPlayer?.username || 'outro jogador'}.`);
+      return;
+    }
     soundManager.playLoss();
     const updated = [...tablePlayers];
     const currName = updated[activePlayerIndex]?.username || 'Jogador';
@@ -719,10 +815,15 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
   };
 
   const handleMultiCallOrCheck = () => {
+    if (multiStage === 'WAITING' || multiStage === 'SHOWDOWN') return;
+    if (!isMyTurn) {
+      showToast(`Aguarde! Agora é a vez de ${currentTurnPlayer?.username || 'outro jogador'}.`);
+      return;
+    }
     soundManager.playClick();
     const updated = [...tablePlayers];
     const curr = { ...updated[activePlayerIndex] };
-    const needed = currentHighestBet - curr.currentStreetBet;
+    const needed = Math.max(0, currentHighestBet - curr.currentStreetBet);
     let nextPot = multiPot;
 
     if (needed > 0) {
@@ -749,6 +850,11 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
   };
 
   const handleMultiRaise = () => {
+    if (multiStage === 'WAITING' || multiStage === 'SHOWDOWN') return;
+    if (!isMyTurn) {
+      showToast(`Aguarde! Agora é a vez de ${currentTurnPlayer?.username || 'outro jogador'}.`);
+      return;
+    }
     const updated = [...tablePlayers];
     const curr = { ...updated[activePlayerIndex] };
     if (!curr.username) return;
@@ -790,25 +896,31 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
 
     if (active.length === 1) {
       const winner = { ...active[0], chips: active[0].chips + potVal };
-      const finalList = currentList.map((p) => (p.username === winner.username ? winner : p));
+      const finalList = currentList.map((p) =>
+        (p.uid && winner.uid ? p.uid === winner.uid : p.username === winner.username) ? winner : p
+      );
       const msg = `🏆 ${winner.username} venceu o pote de ${potVal.toLocaleString('pt-BR')} fichas!`;
+      const subtitle = `Vitória de ${winner.username} (Desistência)`;
       soundManager.playWin();
       setTablePlayers(finalList);
       setMultiWinnerMsg(msg);
       setMultiStage('SHOWDOWN');
       persistMultiBalances(finalList);
-      scheduleVictoryModal(potVal, "TEXAS HOLD'EM MULTIPLAYER", `Vitória de ${winner.username} (Desistência)`, 350);
       if (activeRoom?.isFirestore) {
         void syncPokerEstadoToFirestore(activeRoom.id, 'finalizado', {
           stage: 'SHOWDOWN',
+          roundId: multiRoundId,
           pot: potVal,
           highestBet: highestVal,
           activePlayerIndex,
           communityCards: multiCommunityCards,
           revealedCount: multiRevealedCount,
           players: finalList,
-          winnerMsg: msg
+          winnerMsg: msg,
+          winnerSubtitle: subtitle
         });
+      } else {
+        scheduleVictoryModal(potVal, "TEXAS HOLD'EM MULTIPLAYER", subtitle, 350);
       }
       return;
     }
@@ -830,6 +942,7 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
       if (activeRoom?.isFirestore) {
         void syncPokerEstadoToFirestore(activeRoom.id, 'jogando', {
           stage: multiStage,
+          roundId: multiRoundId,
           pot: potVal,
           highestBet: highestVal,
           activePlayerIndex: nextIdx,
@@ -851,8 +964,11 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
 
   const advanceMultiStreet = (currentList: TablePlayer[], potVal = multiPot) => {
     const resetList = currentList.map(p => ({ ...p, currentStreetBet: 0 }));
+    let firstActiveIdx = resetList.findIndex(p => !p.folded && !p.isAllIn);
+    if (firstActiveIdx === -1) firstActiveIdx = 0;
+
     setCurrentHighestBet(0);
-    setActivePlayerIndex(0);
+    setActivePlayerIndex(firstActiveIdx);
     setPeekHoleCards(false);
     setTablePlayers(resetList);
 
@@ -881,14 +997,23 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     if (activeRoom?.isFirestore) {
       void syncPokerEstadoToFirestore(activeRoom.id, 'jogando', {
         stage: nextStage,
+        roundId: multiRoundId,
         pot: potVal,
         highestBet: 0,
-        activePlayerIndex: 0,
+        activePlayerIndex: firstActiveIdx,
         communityCards: multiCommunityCards,
         revealedCount: nextRevealed,
         players: resetList,
         winnerMsg: ''
       });
+    }
+    if (activeRoom?.id && resetList[firstActiveIdx]) {
+      const nextUser = resetList[firstActiveIdx].username;
+      void enviarJogadaRtdb(activeRoom.id, {
+        apostaAtual: 0,
+        turnoAtual: nextUser
+      });
+      void updateRoomTurnTimer(activeRoom.id, nextUser, 25);
     }
   };
 
@@ -908,24 +1033,28 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     const winner = activeShowdown[0];
     winner.chips += potVal;
     const msg = `🎉 ${winner.username} venceu o pote com ${winner.handResult?.name}! (+${potVal.toLocaleString('pt-BR')} fichas)`;
+    const subtitle = `${winner.username} · ${winner.handResult?.name || ''}`;
 
     soundManager.playJackpot();
     setMultiWinnerMsg(msg);
     setTablePlayers(evaluated);
     persistMultiBalances(evaluated);
-    scheduleVictoryModal(potVal, "TEXAS HOLD'EM MULTIPLAYER", `${winner.username} · ${winner.handResult?.name || ''}`, 950);
 
     if (activeRoom?.isFirestore) {
       void syncPokerEstadoToFirestore(activeRoom.id, 'finalizado', {
         stage: 'SHOWDOWN',
+        roundId: multiRoundId,
         pot: potVal,
         highestBet: 0,
         activePlayerIndex: 0,
         communityCards: multiCommunityCards,
         revealedCount: 5,
         players: evaluated,
-        winnerMsg: msg
+        winnerMsg: msg,
+        winnerSubtitle: subtitle
       });
+    } else {
+      scheduleVictoryModal(potVal, "TEXAS HOLD'EM MULTIPLAYER", subtitle, 950);
     }
   };
 
@@ -1053,24 +1182,34 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
   const allRegisteredUsers = getStoredAccounts();
 
   return (
-    <div className="space-y-2 max-w-5xl mx-auto animate-fade-in pb-1 relative">
+    <div className="h-full max-h-full min-h-0 flex flex-col justify-between gap-1.5 overflow-hidden max-w-5xl mx-auto animate-fade-in relative">
       {toastMsg && (
-        <div className="px-3 py-1.5 rounded-xl bg-amber-950/95 border border-amber-400/70 text-amber-200 text-xs font-bold text-center shadow-lg">
+        <div className="absolute top-10 left-1/2 -translate-x-1/2 z-50 px-3 py-1.5 rounded-xl bg-amber-950/95 border border-amber-400/70 text-amber-200 text-xs font-bold text-center shadow-xl">
           {toastMsg}
         </div>
       )}
-      {/* Top Header & Mode Toggle */}
-      <div className="flex items-center justify-between">
-        <button
-          onClick={onBackToLobby}
-          className="flex items-center gap-1.5 text-xs font-semibold text-slate-400 hover:text-amber-300 transition-colors cursor-pointer"
-        >
-          <ArrowLeft className="w-4 h-4" />
-          <span>Voltar ao Lobby</span>
-        </button>
+      {/* Top Header & Mode Toggle (Compact 100vh) */}
+      <div className="shrink-0 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={onBackToLobby}
+            className="flex items-center gap-1.5 text-xs font-semibold text-slate-400 hover:text-amber-300 transition-colors cursor-pointer"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            <span>Lobby</span>
+          </button>
+
+          <button
+            onClick={() => setShowHowToPlay(true)}
+            className="inline-flex items-center gap-1 text-[11px] text-orange-300/80 hover:text-amber-300 transition-colors cursor-pointer"
+          >
+            <HelpCircle className="w-3.5 h-3.5 text-orange-400" />
+            <span className="hidden sm:inline">Regras</span>
+          </button>
+        </div>
 
         {/* Mode Selector */}
-        <div className="flex items-center p-1 rounded-xl bg-[#180705] border border-orange-500/30">
+        <div className="flex items-center p-0.5 rounded-xl bg-[#180705] border border-orange-500/30">
           <button
             onClick={() => setGameMode('SOLO')}
             className={`px-3 py-1 rounded-lg text-xs font-cinzel font-bold transition-all cursor-pointer ${
@@ -1097,112 +1236,166 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
         </div>
       </div>
 
-      {/* MULTIPLAYER ROOM BAR & LOBBY */}
+      {/* MULTIPLAYER ROOM BAR & LOBBY (Compact so Table + Controls stay in 100vh) */}
       {gameMode === 'MULTIPLAYER' && (
-        <div className="bg-[#180705] border border-orange-500/35 rounded-2xl p-3 shadow-xl space-y-2.5">
+        <div className="shrink-0 bg-[#180705] border border-orange-500/35 rounded-xl p-2 shadow-xl space-y-1.5">
           {!effectiveUid && (
-            <div className="bg-[#240a06] border border-amber-500/40 rounded-xl p-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-200">
+            <div className="bg-[#240a06] border border-amber-500/40 rounded-lg px-2.5 py-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-amber-200">
               <span>Faça login no Firebase para ver e entrar nas salas online de outros jogadores.</span>
               <button
                 type="button"
                 onClick={() => onRequestLogin?.()}
-                className="px-3 py-1 rounded-lg bg-amber-500 text-slate-950 font-black cursor-pointer"
+                className="px-2.5 py-1 rounded-lg bg-amber-500 text-slate-950 font-black cursor-pointer"
               >
                 Entrar / Criar Conta
               </button>
             </div>
           )}
 
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-xs font-bold text-amber-300 flex items-center gap-1">
-                <Users className="w-3.5 h-3.5 text-orange-400" />
-                <span>Salas Online ({rooms.length}):</span>
-              </span>
-              {rooms.length === 0 ? (
-                <span className="text-xs text-orange-200/60">Nenhuma sala aberta ainda. Crie a primeira!</span>
-              ) : (
-                rooms.map(r => {
-                  const isSelected = activeRoom?.id === r.id;
-                  return (
+          {!activeRoom ? (
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 flex-wrap max-h-16 overflow-y-auto">
+                <span className="text-xs font-bold text-amber-300 flex items-center gap-1">
+                  <Users className="w-3.5 h-3.5 text-orange-400" />
+                  <span>Salas ({rooms.length}):</span>
+                </span>
+                {rooms.length === 0 ? (
+                  <span className="text-xs text-orange-200/60">Nenhuma sala aberta. Crie a primeira!</span>
+                ) : (
+                  rooms.map(r => (
                     <button
                       key={r.id}
                       onClick={() => void handleJoinRoom(r)}
-                      className={`px-3 py-1 rounded-lg text-xs font-bold border transition-all cursor-pointer flex items-center gap-1.5 shadow ${
-                        isSelected
-                          ? 'bg-gradient-to-r from-orange-600 to-amber-600 text-white border-amber-300'
-                          : 'bg-[#250d09] text-orange-200 border-orange-500/30 hover:bg-[#34130d] hover:border-amber-400 hover:text-white'
-                      }`}
+                      className="px-2.5 py-1 rounded-lg text-xs font-bold border transition-all cursor-pointer flex items-center gap-1.5 shadow bg-[#250d09] text-orange-200 border-orange-500/30 hover:bg-[#34130d] hover:border-amber-400 hover:text-white"
                     >
                       <DoorOpen className="w-3 h-3 text-orange-300" />
                       <span>{r.name}</span>
                       <span className="text-[10px] opacity-80">({r.playerNames.length}/8)</span>
                     </button>
-                  );
-                })
-              )}
-            </div>
-
-            {/* Create new room */}
-            <div className="flex items-center gap-1.5">
-              <input
-                type="text"
-                placeholder="Nome da Nova Sala (ex: Mesa Real)..."
-                value={newRoomName}
-                onChange={(e) => setNewRoomName(e.target.value)}
-                className="px-2.5 py-1.5 rounded-lg bg-[#200805] border border-orange-500/35 text-xs text-orange-100 placeholder:text-orange-400/40 w-48 sm:w-56 focus:outline-none focus:border-amber-400"
-              />
-              <button
-                onClick={() => void handleCreateRoom()}
-                disabled={!newRoomName.trim()}
-                className="px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-500 hover:to-amber-500 text-white font-bold text-xs flex items-center gap-1 cursor-pointer shadow disabled:opacity-50"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Criar Sala</span>
-              </button>
-            </div>
-          </div>
-
-          {activeRoom && (
-            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-orange-500/20 pt-2">
-              <div className="flex items-center gap-2 text-xs text-orange-200 flex-wrap">
-                <span className="font-bold text-amber-300">Adicionar Jogador à Mesa:</span>
-                <select
-                  value={selectedUserToJoin}
-                  onChange={(e) => setSelectedUserToJoin(e.target.value)}
-                  className="px-2.5 py-1 rounded-lg bg-[#200805] border border-orange-500/35 text-xs text-orange-100 focus:outline-none focus:border-amber-400"
-                >
-                  <option value="">Selecione um usuário local...</option>
-                  {allRegisteredUsers.map((u: UserAccount) => (
-                    <option key={u.username} value={u.username}>
-                      {u.username} (🪙 {u.balance.toLocaleString('pt-BR')})
-                    </option>
-                  ))}
-                </select>
-                <button
-                  type="button"
-                  onClick={handleAddPlayerToRoom}
-                  disabled={!selectedUserToJoin}
-                  className="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs cursor-pointer disabled:opacity-40"
-                >
-                  + Sentar na Mesa
-                </button>
+                  ))
+                )}
               </div>
 
+              <div className="flex items-center gap-1.5 shrink-0">
+                <input
+                  type="text"
+                  placeholder="Nome da Nova Sala..."
+                  value={newRoomName}
+                  onChange={(e) => setNewRoomName(e.target.value)}
+                  className="px-2.5 py-1 rounded-lg bg-[#200805] border border-orange-500/35 text-xs text-orange-100 placeholder:text-orange-400/40 w-40 sm:w-48 focus:outline-none focus:border-amber-400"
+                />
+                <button
+                  onClick={() => void handleCreateRoom()}
+                  disabled={!newRoomName.trim()}
+                  className="px-3 py-1 rounded-lg bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-500 hover:to-amber-500 text-white font-bold text-xs flex items-center gap-1 cursor-pointer shadow disabled:opacity-50"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Criar</span>
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="px-2 py-0.5 rounded-md bg-amber-500/20 border border-amber-400/50 text-amber-200 font-bold">
+                  ♠ {activeRoom.name} ({tablePlayers.length}/8)
+                </span>
+                <span className="text-[11px] text-orange-200/80">
+                  {isRoomHost ? 'Você é o Anfitrião' : `Anfitrião: ${activeRoom.host}`}
+                </span>
+                {rtdbEstadoLive?.ultimaAcao && (
+                  <span className="hidden md:inline text-[11px] text-emerald-300/90 bg-emerald-950/50 border border-emerald-500/30 px-2 py-0.5 rounded-full">
+                    {rtdbEstadoLive.ultimaAcao}
+                  </span>
+                )}
+              </div>
+
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {!isFirestoreRoom && (
+                  <button
+                    type="button"
+                    onClick={() => setShowAddLocalPlayer(prev => !prev)}
+                    className="px-2.5 py-1 rounded-lg bg-[#250d09] hover:bg-[#34130d] border border-orange-500/35 text-amber-300 text-[11px] font-bold cursor-pointer"
+                  >
+                    + Jogador Local
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => setShowChatDrawer(prev => !prev)}
+                  className={`px-2.5 py-1 rounded-lg border text-[11px] font-bold cursor-pointer ${
+                    showChatDrawer
+                      ? 'bg-amber-500 text-slate-950 border-amber-300'
+                      : 'bg-[#250d09] hover:bg-[#34130d] border-orange-500/35 text-amber-300'
+                  }`}
+                >
+                  💬 Tempo Real & Chat ({rtdbChat.length})
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => void handleLeavePokerRoom()}
+                  className="px-2.5 py-1 rounded-lg bg-red-950/80 hover:bg-red-900 border border-red-500/50 text-red-200 text-[11px] font-bold cursor-pointer"
+                >
+                  Sair da Mesa
+                </button>
+              </div>
+            </div>
+          )}
+
+          {activeRoom && !isFirestoreRoom && showAddLocalPlayer && (
+            <div className="flex items-center gap-2 text-xs text-orange-200 flex-wrap border-t border-orange-500/20 pt-1.5">
+              <span className="font-bold text-amber-300">Adicionar Jogador Local:</span>
+              <select
+                value={selectedUserToJoin}
+                onChange={(e) => setSelectedUserToJoin(e.target.value)}
+                className="px-2 py-1 rounded-lg bg-[#200805] border border-orange-500/35 text-xs text-orange-100 focus:outline-none focus:border-amber-400"
+              >
+                <option value="">Selecione...</option>
+                {allRegisteredUsers.map((u: UserAccount) => (
+                  <option key={u.username} value={u.username}>
+                    {u.username} (🪙 {u.balance.toLocaleString('pt-BR')})
+                  </option>
+                ))}
+              </select>
               <button
                 type="button"
-                onClick={() => void handleLeavePokerRoom()}
-                className="px-3 py-1 rounded-lg bg-red-950/80 hover:bg-red-900 border border-red-500/50 text-red-200 text-xs font-bold cursor-pointer"
+                onClick={handleAddPlayerToRoom}
+                disabled={!selectedUserToJoin}
+                className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs cursor-pointer disabled:opacity-40"
               >
-                Sair da Mesa
+                + Sentar
               </button>
+            </div>
+          )}
+
+          {activeRoom && showChatDrawer && (
+            <div className="border-t border-orange-500/20 pt-1.5">
+              <RoomChatAndPresence
+                presenceMap={rtdbPresence}
+                chatMessages={rtdbChat}
+                timer={rtdbTimer}
+                myUid={pokerUid}
+                myReady={myReady}
+                showReadyToggle={multiStage === 'WAITING' || multiStage === 'SHOWDOWN'}
+                turnPlayerName={rtdbEstadoLive?.turnoAtual || tablePlayers[activePlayerIndex]?.username}
+                onToggleReady={() => {
+                  const next = !myReady;
+                  setMyReady(next);
+                  void presenceHandleRef.current?.setReady(next);
+                }}
+                onSendMessage={async (msg) => {
+                  await sendRoomChatMessage(activeRoom.id, pokerPlayerName, msg, pokerUid);
+                }}
+              />
             </div>
           )}
         </div>
       )}
 
       {/* DUAL-LAYER POKER TABLE (Image 1: Mahogany Rim SVG, Image 2: Velvet Felt SVG) */}
-      <div className="relative rounded-2xl overflow-hidden shadow-2xl min-h-[230px] sm:min-h-[265px] flex flex-col justify-between p-2.5 sm:p-3.5 select-none">
+      <div className="relative rounded-2xl overflow-hidden shadow-2xl flex-1 min-h-0 flex flex-col justify-between p-2 sm:p-3 select-none">
         {/* Layer 1: Mahogany Wood & Leather Rail Rim */}
         <div className="absolute inset-0 pointer-events-none z-0">
           <svg viewBox="0 0 800 450" preserveAspectRatio="none" className="w-full h-full">
@@ -1236,7 +1429,7 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
         </div>
 
         {/* TABLE CONTENT */}
-        <div className="relative z-10 flex flex-col justify-between h-full space-y-1.5">
+        <div className="relative z-10 flex flex-col justify-between h-full min-h-0 gap-1">
           {gameMode === 'SOLO' ? (
             /* ================= SOLO POKER VIEW ================= */
             <>
@@ -1359,83 +1552,115 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
               </div>
             </>
           ) : (
-            /* ================= LOCAL MULTIPLAYER VIEW ================= */
+            /* ================= MULTIPLAYER VIEW (SYNCED VIA FIRESTORE estadoJogo) ================= */
             <>
               {/* Header: Turn banner & Community Pot */}
-              <div className="flex items-center justify-between border-b border-amber-500/20 pb-1.5">
-                <div className="flex items-center gap-2">
-                  <div className="w-3 h-3 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_8px_#34d399]" />
-                  <span className="text-xs sm:text-sm font-bold text-amber-300">
-                    Mesa: <strong className="text-white">{activeRoom?.name || 'Mesa Local'}</strong> · Vez de:{' '}
-                    <strong className="text-amber-400 uppercase font-black">
-                      {tablePlayers[activePlayerIndex]?.username || 'Aguardando Início'}
-                    </strong>
+              <div className="shrink-0 flex items-center justify-between border-b border-amber-500/20 pb-1">
+                <div className="flex items-center gap-2 min-w-0">
+                  <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse shrink-0 shadow-[0_0_8px_#34d399]" />
+                  <span className="text-xs font-bold text-amber-300 truncate">
+                    Mesa: <strong className="text-white">{activeRoom?.name || 'Selecione uma Sala'}</strong> ·{' '}
+                    {multiStage === 'WAITING' ? (
+                      <strong className="text-orange-200">Aguardando Início</strong>
+                    ) : multiStage === 'SHOWDOWN' ? (
+                      <strong className="text-amber-300">Showdown</strong>
+                    ) : (
+                      <>
+                        Vez de:{' '}
+                        <strong className="text-amber-400 uppercase font-black">
+                          {currentTurnPlayer?.username || 'Jogador'}
+                          {isFirestoreRoom && currentTurnPlayer?.uid === effectiveUid ? ' (Sua Vez!)' : ''}
+                        </strong>
+                      </>
+                    )}
                   </span>
                 </div>
 
-                <div className="bg-[#260905] border-2 border-amber-500/60 px-3.5 py-1 rounded-full flex items-center gap-1.5 shadow">
-                  <span className="text-sm">🪙</span>
-                  <span className="font-mono text-xs sm:text-sm font-black text-amber-300">
-                    Pote da Sala: {multiPot.toLocaleString('pt-BR')}
+                <div className="shrink-0 bg-[#260905] border border-amber-500/60 px-3 py-0.5 rounded-full flex items-center gap-1.5 shadow">
+                  <span className="text-xs">🪙</span>
+                  <span className="font-mono text-xs font-black text-amber-300">
+                    Pote: {multiPot.toLocaleString('pt-BR')}
                   </span>
                 </div>
               </div>
 
               {/* 5 Community Cards Center */}
-              <div className="text-center my-1">
-                <div className="flex items-center justify-center gap-2 min-h-[64px]">
-                  {multiCommunityCards.map((c, i) => (
-                    <PlayingCard
-                      key={c.id || i}
-                      card={c}
-                      hidden={i >= multiRevealedCount}
-                      flipDelayMs={i < 3 ? i * 300 : 0}
-                      size="xs"
-                    />
-                  ))}
+              <div className="shrink-0 text-center my-0.5">
+                <div className="flex items-center justify-center gap-1.5 sm:gap-2 min-h-[60px]">
+                  {multiCommunityCards.length === 0
+                    ? Array.from({ length: 5 }).map((_, i) => (
+                        <div key={i} className="w-12 h-17 rounded-lg border border-dashed border-amber-400/25" />
+                      ))
+                    : multiCommunityCards.map((c, i) => (
+                        <PlayingCard
+                          key={c.id || i}
+                          card={c}
+                          hidden={i >= multiRevealedCount}
+                          flipDelayMs={i < 3 ? i * 220 : 0}
+                          size="xs"
+                          floating={false}
+                        />
+                      ))}
                 </div>
               </div>
 
-              {/* Seated Players Grid */}
-              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 my-1">
-                {tablePlayers.slice(0, 5).map((p, idx) => {
+              {/* Seated Players Grid (Up to 8 Players from Firestore estadoJogo) */}
+              <div className="flex-1 min-h-0 overflow-y-auto grid grid-cols-2 sm:grid-cols-4 gap-1.5 my-0.5 content-start">
+                {tablePlayers.slice(0, 8).map((p, idx) => {
                   const isTurn = idx === activePlayerIndex && multiStage !== 'SHOWDOWN' && multiStage !== 'WAITING';
+                  const isMe = isFirestoreRoom && Boolean(effectiveUid) && p.uid === effectiveUid;
+                  const showFace =
+                    (multiStage === 'SHOWDOWN' && !p.folded) ||
+                    (isFirestoreRoom ? (isMe && !hideMyHoleCards) : (isTurn && peekHoleCards));
+
                   return (
                     <div
-                      key={p.username}
-                      className={`p-2 rounded-xl border text-xs transition-all relative ${
+                      key={p.uid || p.username}
+                      className={`p-1.5 rounded-xl border text-xs transition-all relative flex flex-col justify-between ${
                         isTurn
-                          ? 'bg-amber-500/25 border-amber-400 ring-2 ring-amber-400 shadow-lg scale-102'
+                          ? 'bg-amber-500/25 border-amber-400 ring-2 ring-amber-400 shadow-lg'
+                          : isMe
+                          ? 'bg-[#260b07] border-amber-500/50'
                           : p.folded
-                          ? 'bg-black/50 border-slate-800 opacity-40'
-                          : 'bg-[#180503] border-orange-500/30'
+                          ? 'bg-black/50 border-slate-800 opacity-45'
+                          : 'bg-[#180503]/90 border-orange-500/30'
                       }`}
                     >
-                      <div className="flex items-center justify-between mb-0.5">
-                        <span className="font-bold text-orange-100 truncate max-w-[85px]">
-                          {p.username}
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="font-bold text-orange-100 truncate text-[11px]">
+                          {p.username}{isMe ? ' (Você)' : ''}
                         </span>
-                        {p.isDealer && <span className="text-[9px] bg-amber-500 text-slate-950 font-black px-1 rounded">D</span>}
+                        <div className="flex items-center gap-1 shrink-0">
+                          {p.currentStreetBet > 0 && (
+                            <span className="text-[9px] font-mono bg-amber-950/90 text-amber-300 border border-amber-500/40 px-1 rounded">
+                              {p.currentStreetBet}
+                            </span>
+                          )}
+                          {p.isDealer && <span className="text-[9px] bg-amber-500 text-slate-950 font-black px-1 rounded">D</span>}
+                        </div>
                       </div>
-                      <div className="font-mono text-[11px] text-amber-300 font-extrabold">
+
+                      <div className="font-mono text-[10px] text-amber-300 font-extrabold leading-tight">
                         🪙 {p.chips.toLocaleString('pt-BR')}
                       </div>
-                      <div className="flex items-center gap-1 mt-1 justify-center min-h-[40px]">
+
+                      <div className="flex items-center gap-1 mt-1 justify-center min-h-[54px]">
                         {p.folded ? (
-                          <span className="text-[10px] text-red-400 font-bold">FOLD</span>
-                        ) : isTurn && peekHoleCards ? (
+                          <span className="text-[10px] text-red-400 font-black tracking-wider">FOLD</span>
+                        ) : Array.isArray(p.holeCards) && p.holeCards.length > 0 ? (
                           p.holeCards.map((c, ci) => (
-                            <PlayingCard key={c.id || ci} card={c} size="xs" floating={false} withDealerHand={ci === 1} flipDelayMs={ci * 300} />
-                          ))
-                        ) : multiStage === 'SHOWDOWN' && !p.folded ? (
-                          p.holeCards.map((c, ci) => (
-                            <PlayingCard key={c.id || ci} card={c} size="xs" floating={false} flipDelayMs={ci * 300} />
+                            <PlayingCard
+                              key={c.id || `${p.uid || p.username}-${ci}`}
+                              card={c}
+                              hidden={!showFace}
+                              size="xs"
+                              floating={false}
+                              tilt3d={false}
+                              skipInitialFlip={isFirestoreRoom && isMe && !hideMyHoleCards}
+                            />
                           ))
                         ) : (
-                          <div className="flex gap-1.5 opacity-80">
-                            <div className="w-7 h-10 rounded bg-[#200503] border border-amber-500/50 flex items-center justify-center text-[9px] text-amber-300 font-bold">♠</div>
-                            <div className="w-7 h-10 rounded bg-[#200503] border border-amber-500/50 flex items-center justify-center text-[9px] text-amber-300 font-bold">♥</div>
-                          </div>
+                          <span className="text-[10px] text-orange-300/45 italic">Na mesa</span>
                         )}
                       </div>
                     </div>
@@ -1445,7 +1670,7 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
 
               {/* Showdown Winner Message */}
               {multiWinnerMsg && (
-                <div className="text-center p-1.5 bg-amber-500/20 border-2 border-amber-400 rounded-xl text-xs sm:text-sm font-bold text-amber-200">
+                <div className="shrink-0 text-center py-1 px-2 bg-amber-500/20 border border-amber-400 rounded-xl text-xs font-bold text-amber-200 truncate">
                   {multiWinnerMsg}
                 </div>
               )}
@@ -1454,8 +1679,8 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
         </div>
       </div>
 
-      {/* RESTORED COMFORTABLE ACTION CONTROLS */}
-      <div className="bg-[#180705] border border-orange-500/30 rounded-2xl p-2.5 shadow-xl">
+      {/* COMPACT ACTION CONTROLS (ALWAYS VISIBLE IN 100VH) */}
+      <div className="shrink-0 bg-[#180705] border border-orange-500/30 rounded-2xl p-2 shadow-xl">
         {gameMode === 'SOLO' ? (
           soloStage === 'BETTING' || soloStage === 'SHOWDOWN' ? (
             <div className="flex flex-col gap-2">
@@ -1543,30 +1768,42 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
             </div>
           )
         ) : (
-          /* ================= LOCAL MULTIPLAYER CONTROLS ================= */
-          multiStage === 'WAITING' || multiStage === 'SHOWDOWN' ? (
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
-              <div className="flex items-center gap-2 flex-wrap text-xs text-orange-200">
-                <span className="font-bold text-amber-300">Jogadores na Mesa ({tablePlayers.length}/8):</span>
+          /* ================= MULTIPLAYER CONTROLS ================= */
+          !activeRoom ? (
+            <div className="text-center text-xs text-orange-200/80 py-1.5">
+              Crie uma sala ou clique em uma mesa aberta acima para jogar com outros jogadores em tempo real.
+            </div>
+          ) : multiStage === 'WAITING' || multiStage === 'SHOWDOWN' ? (
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 flex-wrap text-xs text-orange-200">
+                <span className="font-bold text-amber-300">Na Mesa ({tablePlayers.length}/8):</span>
                 {tablePlayers.map(p => (
-                  <span key={p.username} className="px-2.5 py-1 rounded-md bg-[#250d09] border border-orange-500/30 text-white font-mono font-bold">
+                  <span key={p.uid || p.username} className="px-2 py-0.5 rounded-md bg-[#250d09] border border-orange-500/30 text-white font-mono text-[11px] font-bold">
                     {p.username}
                   </span>
                 ))}
               </div>
 
-              <button
-                type="button"
-                onClick={startNewMultiplayerHand}
-                disabled={tablePlayers.length < 2}
-                className="px-8 py-2.5 rounded-xl bg-gradient-to-r from-orange-500 via-red-600 to-amber-500 hover:brightness-110 text-white font-cinzel font-black text-xs sm:text-sm shadow-xl flex items-center justify-center gap-2 cursor-pointer disabled:opacity-40"
-              >
-                <Play className="w-4 h-4 fill-current" />
-                <span>{multiStage === 'SHOWDOWN' ? 'Nova Mão de Pôquer 🃏' : `Iniciar Partida (${tablePlayers.length} Jogadores) 🃏`}</span>
-              </button>
+              {isRoomHost ? (
+                <button
+                  type="button"
+                  onClick={startNewMultiplayerHand}
+                  disabled={tablePlayers.length < 2}
+                  className="px-6 py-2 rounded-xl bg-gradient-to-r from-orange-500 via-red-600 to-amber-500 hover:brightness-110 text-white font-cinzel font-black text-xs sm:text-sm shadow-xl flex items-center justify-center gap-2 cursor-pointer disabled:opacity-40 shrink-0"
+                >
+                  <Play className="w-4 h-4 fill-current" />
+                  <span>{multiStage === 'SHOWDOWN' ? 'Nova Mão de Pôquer 🃏' : `Iniciar Partida (${tablePlayers.length} Jogadores) 🃏`}</span>
+                </button>
+              ) : (
+                <div className="px-4 py-2 rounded-xl bg-[#250d09] border border-amber-500/35 text-amber-200 text-xs font-bold text-center shrink-0">
+                  {tablePlayers.length < 2
+                    ? 'Aguardando mais jogadores...'
+                    : `Aguardando anfitrião (${activeRoom.host}) iniciar...`}
+                </div>
+              )}
             </div>
           ) : (
-            <div className="space-y-2">
+            <div className="space-y-1.5">
               <ChipSelector
                 currentBet={multiRaiseAmount}
                 balance={tablePlayers[activePlayerIndex]?.chips || 0}
@@ -1577,20 +1814,38 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
               />
 
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <button
-                  type="button"
-                  onClick={() => setPeekHoleCards(prev => !prev)}
-                  className="px-3 py-2 rounded-xl bg-[#2a0e08] hover:bg-[#3d140b] border border-amber-500/40 text-amber-300 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
-                >
-                  {peekHoleCards ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  <span>{peekHoleCards ? 'Ocultar Cartas' : `Espiar Cartas (${tablePlayers[activePlayerIndex]?.username})`}</span>
-                </button>
+                {isFirestoreRoom ? (
+                  <button
+                    type="button"
+                    onClick={() => setHideMyHoleCards(prev => !prev)}
+                    className="px-3 py-1.5 rounded-xl bg-[#2a0e08] hover:bg-[#3d140b] border border-amber-500/40 text-amber-300 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    {hideMyHoleCards ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+                    <span>{hideMyHoleCards ? 'Mostrar Minhas Cartas' : 'Ocultar Minhas Cartas'}</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setPeekHoleCards(prev => !prev)}
+                    className="px-3 py-1.5 rounded-xl bg-[#2a0e08] hover:bg-[#3d140b] border border-amber-500/40 text-amber-300 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    {peekHoleCards ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    <span>{peekHoleCards ? 'Ocultar Cartas' : `Espiar Cartas (${tablePlayers[activePlayerIndex]?.username})`}</span>
+                  </button>
+                )}
 
                 <div className="flex items-center gap-2 flex-wrap">
+                  {isFirestoreRoom && !isMyTurn && (
+                    <span className="text-[11px] font-bold text-amber-300/90 px-2">
+                      Aguardando vez de {currentTurnPlayer?.username}...
+                    </span>
+                  )}
+
                   <button
                     type="button"
                     onClick={handleMultiFold}
-                    className="px-4 py-2 rounded-xl bg-red-950/90 hover:bg-red-900 border border-red-500/60 text-red-200 font-bold text-xs sm:text-sm cursor-pointer flex items-center gap-1.5 shadow"
+                    disabled={!isMyTurn}
+                    className="px-3.5 py-1.5 rounded-xl bg-red-950/90 hover:bg-red-900 border border-red-500/60 text-red-200 font-bold text-xs sm:text-sm cursor-pointer flex items-center gap-1.5 shadow disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <XCircle className="w-4 h-4" />
                     <span>Fold</span>
@@ -1599,7 +1854,8 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
                   <button
                     type="button"
                     onClick={handleMultiCallOrCheck}
-                    className="px-4 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-600 border border-emerald-400 text-white font-bold text-xs sm:text-sm cursor-pointer flex items-center gap-1.5 shadow"
+                    disabled={!isMyTurn}
+                    className="px-3.5 py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-600 border border-emerald-400 text-white font-bold text-xs sm:text-sm cursor-pointer flex items-center gap-1.5 shadow disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <Check className="w-4 h-4" />
                     <span>
@@ -1612,8 +1868,8 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
                   <button
                     type="button"
                     onClick={handleMultiRaise}
-                    disabled={multiRaiseAmount <= 0 || multiRaiseAmount > (tablePlayers[activePlayerIndex]?.chips || 0)}
-                    className="px-5 py-2 rounded-xl bg-gradient-to-r from-orange-500 via-amber-500 to-yellow-500 hover:brightness-110 text-slate-950 font-black text-xs sm:text-sm cursor-pointer flex items-center gap-1.5 shadow-lg disabled:opacity-40"
+                    disabled={!isMyTurn || multiRaiseAmount <= 0 || multiRaiseAmount > (tablePlayers[activePlayerIndex]?.chips || 0)}
+                    className="px-4 py-1.5 rounded-xl bg-gradient-to-r from-orange-500 via-amber-500 to-yellow-500 hover:brightness-110 text-slate-950 font-black text-xs sm:text-sm cursor-pointer flex items-center gap-1.5 shadow-lg disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <ArrowUpRight className="w-4 h-4" />
                     <span>Raise (+{multiRaiseAmount.toLocaleString('pt-BR')} Fichas)</span>
@@ -1623,37 +1879,6 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
             </div>
           )
         )}
-      </div>
-
-      {gameMode === 'MULTIPLAYER' && activeRoom && (
-        <RoomChatAndPresence
-          presenceMap={rtdbPresence}
-          chatMessages={rtdbChat}
-          timer={rtdbTimer}
-          myUid={pokerUid}
-          myReady={myReady}
-          showReadyToggle={multiStage === 'WAITING' || multiStage === 'SHOWDOWN'}
-          turnPlayerName={rtdbEstadoLive?.turnoAtual || tablePlayers[activePlayerIndex]?.username}
-          onToggleReady={() => {
-            const next = !myReady;
-            setMyReady(next);
-            void presenceHandleRef.current?.setReady(next);
-          }}
-          onSendMessage={async (msg) => {
-            await sendRoomChatMessage(activeRoom.id, pokerPlayerName, msg, pokerUid);
-          }}
-        />
-      )}
-
-      {/* Como Jogar Button */}
-      <div className="pt-0.5 text-center">
-        <button
-          onClick={() => setShowHowToPlay(true)}
-          className="inline-flex items-center gap-1 text-[11px] text-orange-300/70 hover:text-amber-300 transition-colors cursor-pointer py-0.5"
-        >
-          <HelpCircle className="w-3.5 h-3.5 text-orange-400" />
-          <span>Regras do Texas Hold'em No-Limit & Salas Multiplayer</span>
-        </button>
       </div>
 
       <HowToPlayModal

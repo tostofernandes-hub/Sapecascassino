@@ -27,13 +27,12 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == uid;
     }
 
-    // Validation Blueprint: Usuario (usuarios/{uid})
+    // Validation Blueprint: Usuario Public Leaderboard Profile (usuarios/{uid} - zero PII)
     function isValidUsuario(data, uid) {
       return data.keys().hasAll(['uid', 'nome', 'saldo', 'criadoEm', 'atualizadoEm'])
-        && data.keys().hasOnly(['uid', 'nome', 'email', 'avatar', 'saldo', 'maiorVitoria', 'totalVitorias', 'totalDerrotas', 'criadoEm', 'atualizadoEm'])
+        && data.keys().hasOnly(['uid', 'nome', 'avatar', 'saldo', 'maiorVitoria', 'totalVitorias', 'totalDerrotas', 'criadoEm', 'atualizadoEm'])
         && data.uid is string && data.uid == request.auth.uid && data.uid == uid
         && data.nome is string && data.nome.size() >= 1 && data.nome.size() <= 32
-        && (!('email' in data) || (data.email is string && data.email.size() <= 120))
         && (!('avatar' in data) || (data.avatar is string && data.avatar.size() <= 16))
         && data.saldo is number && data.saldo >= 0 && data.saldo <= 1000000000
         && (!('maiorVitoria' in data) || (data.maiorVitoria is number && data.maiorVitoria >= 0 && data.maiorVitoria <= 1000000000))
@@ -140,10 +139,10 @@ service cloud.firestore {
         ]);
     }
 
-    // Collection: usuarios/{uid} (Owner-only PII & Balance Protection)
+    // Collection: usuarios/{uid} (Public Ranking Profile - Owner-only Writes, Authenticated Reads)
     match /usuarios/{uid} {
-      allow get: if isValidId(uid) && isOwner(uid);
-      allow list: if false;
+      allow get: if isSignedIn() && isValidId(uid);
+      allow list: if isSignedIn();
       allow create: if isValidId(uid)
         && isOwner(uid)
         && isValidUsuario(incoming(), uid)
@@ -156,9 +155,22 @@ service cloud.firestore {
         && (!('criadoEm' in existing()) || !(existing().criadoEm is timestamp) || incoming().criadoEm == existing().criadoEm)
         && incoming().atualizadoEm == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly([
-          'uid', 'nome', 'email', 'avatar', 'saldo', 'maiorVitoria', 'totalVitorias', 'totalDerrotas', 'criadoEm', 'atualizadoEm'
+          'uid', 'nome', 'avatar', 'saldo', 'maiorVitoria', 'totalVitorias', 'totalDerrotas', 'criadoEm', 'atualizadoEm'
         ]);
       allow delete: if false;
+
+      // Isolated Owner-Only PII Subcollection (usuarios/{uid}/privado/info)
+      match /privado/{docId} {
+        allow get, create, update: if isValidId(uid)
+          && isOwner(uid)
+          && docId == 'info'
+          && (request.method == 'get' || (
+            incoming().keys().hasOnly(['email', 'atualizadoEm'])
+            && (!('email' in incoming()) || (incoming().email is string && incoming().email.size() <= 120))
+            && incoming().atualizadoEm == request.time
+          ));
+        allow list, delete: if false;
+      }
     }
 
     // Collection: salas/{salaId} (Authenticated Realtime Multiplayer Tables)

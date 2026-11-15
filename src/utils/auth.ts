@@ -131,7 +131,6 @@ function translateFirebaseAuthError(err: unknown): string {
 const ALLOWED_USUARIO_KEYS = new Set([
   'uid',
   'nome',
-  'email',
   'avatar',
   'saldo',
   'maiorVitoria',
@@ -190,7 +189,6 @@ export async function syncUserToFirestore(account: UserAccount): Promise<void> {
         await setDoc(userRef, {
           uid,
           nome,
-          email,
           avatar,
           saldo,
           maiorVitoria,
@@ -209,7 +207,6 @@ export async function syncUserToFirestore(account: UserAccount): Promise<void> {
           await setDoc(userRef, {
             uid,
             nome,
-            email,
             avatar,
             saldo,
             maiorVitoria,
@@ -221,7 +218,6 @@ export async function syncUserToFirestore(account: UserAccount): Promise<void> {
         } else {
           await updateDoc(userRef, {
             nome,
-            email,
             avatar,
             saldo,
             maiorVitoria,
@@ -230,6 +226,14 @@ export async function syncUserToFirestore(account: UserAccount): Promise<void> {
             atualizadoEm: serverTimestamp(),
           });
         }
+      }
+
+      if (email) {
+        const privateRef = doc(db, 'usuarios', uid, 'privado', 'info');
+        await setDoc(privateRef, {
+          email,
+          atualizadoEm: serverTimestamp(),
+        }).catch(() => {});
       }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -262,9 +266,31 @@ export async function loadFirestoreUser(
 
     if (snap.exists()) {
       const data = snap.data();
+      // If legacy document still contains PII email or missing fields, strip & migrate cleanly
+      if ('email' in data || !(data.criadoEm instanceof Timestamp) || data.uid !== uid) {
+        await setDoc(userRef, {
+          uid,
+          nome: String(data.nome || fallbackName || fallbackEmail?.split('@')[0] || 'Jogador').slice(0, 32),
+          avatar: String(data.avatar || localExisting?.avatar || '🦁').slice(0, 16),
+          saldo: safeNonNegativeInt(data.saldo, localExisting?.balance ?? 10000),
+          maiorVitoria: safeNonNegativeInt(data.maiorVitoria, localExisting?.biggestWin ?? 0),
+          totalVitorias: safeNonNegativeInt(data.totalVitorias, localExisting?.totalWins ?? 0),
+          totalDerrotas: safeNonNegativeInt(data.totalDerrotas, localExisting?.totalLosses ?? 0),
+          criadoEm: data.criadoEm instanceof Timestamp ? data.criadoEm : serverTimestamp(),
+          atualizadoEm: serverTimestamp(),
+        }).catch(() => {});
+        const resolvedEmail = (fallbackEmail || (typeof data.email === 'string' ? data.email : '') || '').slice(0, 120);
+        if (resolvedEmail) {
+          await setDoc(doc(db, 'usuarios', uid, 'privado', 'info'), {
+            email: resolvedEmail,
+            atualizadoEm: serverTimestamp(),
+          }).catch(() => {});
+        }
+      }
+
       const merged: UserAccount = {
         uid,
-        email: data.email || fallbackEmail || localExisting?.email || '',
+        email: fallbackEmail || (typeof data.email === 'string' ? data.email : '') || localExisting?.email || '',
         username: data.nome || fallbackName || localExisting?.username || 'Jogador',
         avatar: data.avatar || localExisting?.avatar || '🦁',
         balance: typeof data.saldo === 'number' ? data.saldo : localExisting?.balance ?? 10000,
@@ -311,7 +337,6 @@ export async function loadFirestoreUser(
     await setDoc(userRef, {
       uid,
       nome: saved.username.slice(0, 32),
-      email: (saved.email || '').slice(0, 120),
       avatar: (saved.avatar || '🦁').slice(0, 16),
       saldo: safeNonNegativeInt(saved.balance, 10000),
       maiorVitoria: safeNonNegativeInt(saved.biggestWin, 0),
@@ -326,6 +351,12 @@ export async function loadFirestoreUser(
       }
       console.warn('Erro ao criar usuário no Firestore:', error);
     });
+    if (saved.email) {
+      await setDoc(doc(db, 'usuarios', uid, 'privado', 'info'), {
+        email: saved.email.slice(0, 120),
+        atualizadoEm: serverTimestamp(),
+      }).catch(() => {});
+    }
     return saved;
   });
 }

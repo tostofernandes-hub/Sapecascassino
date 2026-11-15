@@ -2,7 +2,7 @@
   "entities": {
     "Usuario": {
       "title": "Usuario",
-      "description": "Perfil e saldo de fichas fictícias do jogador no Sapecas Cassino",
+      "description": "Perfil público de ranking e saldo de fichas fictícias do jogador no Sapecas Cassino (sem PII)",
       "type": "object",
       "properties": {
         "uid": {
@@ -16,12 +16,6 @@
           "minLength": 1,
           "maxLength": 32,
           "description": "Nome de exibição do jogador"
-        },
-        "email": {
-          "type": "string",
-          "format": "email",
-          "maxLength": 120,
-          "description": "E-mail do jogador (PII restrita ao dono da conta)"
         },
         "avatar": {
           "type": "string",
@@ -56,6 +50,24 @@
         }
       },
       "required": ["uid", "nome", "saldo", "criadoEm", "atualizadoEm"]
+    },
+    "UsuarioPrivado": {
+      "title": "UsuarioPrivado",
+      "description": "Subcoleção isolada apenas para o dono com PII (e-mail)",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 120,
+          "description": "E-mail do jogador (PII restrita ao dono da conta)"
+        },
+        "atualizadoEm": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp do servidor na última atualização"
+        }
+      }
     },
     "SalaJogo": {
       "title": "SalaJogo",
@@ -144,7 +156,11 @@
   "firestore": {
     "/usuarios/{uid}": {
       "schema": { "$ref": "#/entities/Usuario" },
-      "description": "Documentos privados de conta e saldo de cada usuário autenticado"
+      "description": "Perfis públicos de ranking e saldo (leitura autenticada, escrita apenas do dono, sem PII)"
+    },
+    "/usuarios/{uid}/privado/{docId}": {
+      "schema": { "$ref": "#/entities/UsuarioPrivado" },
+      "description": "Dados privados (e-mail) isolados exclusivamente para o dono da conta"
     },
     "/salas/{salaId}": {
       "schema": { "$ref": "#/entities/SalaJogo" },
