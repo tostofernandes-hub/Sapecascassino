@@ -468,6 +468,9 @@ export default function App() {
               balance={userBalance}
               onUpdateBalance={(delta, isWin, gId, bet) => handleUpdateBalance(delta, isWin, 'texas-holdem', bet)}
               onBackToLobby={() => setActiveGame('lobby')}
+              currentUser={currentUser}
+              firebaseUid={firebaseUid}
+              onRequestLogin={() => setLoginModalOpen(true)}
             />
           )}
 
@@ -551,6 +554,9 @@ export default function App() {
               onUpdateBalance={(delta, isWin, gId, bet) => handleUpdateBalance(delta, isWin, 'liars-bar', bet)}
               onBackToLobby={() => setActiveGame('lobby')}
               username={currentUser?.username}
+              currentUser={currentUser}
+              firebaseUid={firebaseUid}
+              onRequestLogin={() => setLoginModalOpen(true)}
             />
           )}
 

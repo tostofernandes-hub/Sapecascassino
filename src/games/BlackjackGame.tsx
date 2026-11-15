@@ -28,8 +28,7 @@ import {
   updateDoc,
   deleteDoc,
   onSnapshot,
-  query,
-  where,
+  arrayUnion,
   serverTimestamp
 } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType } from '../firebase';
@@ -331,13 +330,13 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
     }
 
     setRoomsLoading(true);
-    const q = query(collection(db, 'salas'), where('jogo', '==', 'blackjack'));
     const unsub = onSnapshot(
-      q,
+      collection(db, 'salas'),
       (snapshot) => {
         const loaded: BlackjackSala[] = [];
         snapshot.forEach((docSnap) => {
           const data = docSnap.data() as Omit<BlackjackSala, 'id'>;
+          if (data.jogo !== 'blackjack') return;
           loaded.push({
             ...data,
             id: docSnap.id
@@ -583,7 +582,7 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
     }
     const alreadyIn = room.jogadores.includes(effectiveUid);
     if (!alreadyIn) {
-      if (room.status !== 'aguardando') {
+      if (room.status === 'jogando') {
         showToast('Esta mesa já está com uma rodada em andamento. Aguarde ou entre em outra sala.');
         return;
       }
@@ -597,20 +596,14 @@ export const BlackjackGame: React.FC<BlackjackGameProps> = ({
     const roomPath = `salas/${room.id}`;
     try {
       if (!alreadyIn) {
-        const nextJogadores = [...room.jogadores, effectiveUid];
-        const nextInfo = {
-          ...(room.jogadoresInfo || {}),
-          [effectiveUid]: {
+        await updateDoc(doc(db, 'salas', room.id), {
+          jogadores: arrayUnion(effectiveUid),
+          [`jogadoresInfo.${effectiveUid}`]: {
             uid: effectiveUid,
             nome: playerName,
             avatar: playerAvatar,
             aposta: Math.min(balance > 0 ? balance : 50, room.apostaMinima || 50)
-          }
-        };
-
-        await updateDoc(doc(db, 'salas', room.id), {
-          jogadores: nextJogadores,
-          jogadoresInfo: nextInfo,
+          },
           atualizadoEm: serverTimestamp()
         });
       }

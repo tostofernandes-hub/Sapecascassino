@@ -21,7 +21,18 @@ import {
   Plus, 
   DoorOpen
 } from 'lucide-react';
-import { auth } from '../firebase';
+import {
+  collection,
+  doc,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  onSnapshot,
+  arrayUnion,
+  arrayRemove,
+  serverTimestamp
+} from 'firebase/firestore';
+import { auth, db, handleFirestoreError, OperationType } from '../firebase';
 import { getCurrentUser } from '../utils/auth';
 import {
   connectRoomPresence,
@@ -41,20 +52,37 @@ interface TexasHoldemGameProps {
   balance: number;
   onUpdateBalance: (delta: number, isWin: boolean, gameId: 'texas-holdem', betAmount?: number) => void;
   onBackToLobby: () => void;
+  currentUser?: UserAccount | null;
+  firebaseUid?: string | null;
+  onRequestLogin?: () => void;
 }
 
 type HoldemMode = 'SOLO' | 'MULTIPLAYER';
 type SoloStage = 'BETTING' | 'FLOP_ROUND' | 'TURN_ROUND' | 'SHOWDOWN';
 
+interface PokerPlayerMeta {
+  uid: string;
+  nome: string;
+  avatar?: string;
+  saldo?: number;
+  aposta?: number;
+}
+
 interface PokerRoom {
   id: string;
   name: string;
   host: string;
+  criadorId?: string;
   createdAt: number;
   playerNames: string[];
+  jogadores?: string[];
+  jogadoresInfo?: Record<string, PokerPlayerMeta>;
+  status?: 'aguardando' | 'jogando' | 'finalizado';
+  isFirestore?: boolean;
 }
 
 interface TablePlayer {
+  uid?: string;
   username: string;
   chips: number;
   holeCards: Card[];
@@ -71,7 +99,10 @@ const ROOMS_KEY = 'sapecas_poker_rooms_v1';
 export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
   balance,
   onUpdateBalance,
-  onBackToLobby
+  onBackToLobby,
+  currentUser,
+  firebaseUid,
+  onRequestLogin
 }) => {
   const [gameMode, setGameMode] = useState<HoldemMode>('SOLO');
   const [showHowToPlay, setShowHowToPlay] = useState<boolean>(false);
@@ -135,9 +166,11 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
   const [myReady, setMyReady] = useState<boolean>(false);
   const presenceHandleRef = useRef<{ setReady: (pronto: boolean) => Promise<void>; disconnect: () => Promise<void> } | null>(null);
 
-  const pokerUser = getCurrentUser();
-  const pokerUid = auth.currentUser?.uid || pokerUser?.uid || pokerUser?.username || 'jogador';
-  const pokerPlayerName = pokerUser?.nickname || pokerUser?.username || auth.currentUser?.displayName || 'Jogador';
+  const pokerUser = currentUser || getCurrentUser();
+  const effectiveUid = firebaseUid || auth.currentUser?.uid || null;
+  const pokerUid = effectiveUid || pokerUser?.uid || pokerUser?.username || 'jogador';
+  const pokerPlayerName = (pokerUser?.nickname || pokerUser?.username || auth.currentUser?.displayName || 'Jogador').slice(0, 32);
+  const pokerAvatar = (pokerUser?.avatar || '🦁').slice(0, 16);
 
   useEffect(() => {
     if (gameMode !== 'MULTIPLAYER' || !activeRoom?.id || !auth.currentUser?.uid) {
@@ -170,10 +203,135 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     };
   }, [gameMode, activeRoom?.id, pokerPlayerName]);
 
-  // Load rooms from localStorage
+  // Listen to ALL Poker rooms from Firestore in real time (collection(db, 'salas'))
   useEffect(() => {
-    loadRooms();
-  }, []);
+    if (gameMode !== 'MULTIPLAYER') return;
+    if (!effectiveUid) {
+      loadRooms();
+      return;
+    }
+
+    const unsub = onSnapshot(
+      collection(db, 'salas'),
+      (snapshot) => {
+        const fsRooms: PokerRoom[] = [];
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data() as Record<string, unknown>;
+          if (data.jogo !== 'poker') return;
+          const jogadores = Array.isArray(data.jogadores) ? (data.jogadores as string[]) : [];
+          const infoMap = (data.jogadoresInfo && typeof data.jogadoresInfo === 'object'
+            ? data.jogadoresInfo
+            : {}) as Record<string, PokerPlayerMeta>;
+          const playerNames = jogadores.map((uid) => infoMap[uid]?.nome || uid.slice(0, 8));
+          const tsObj = data.atualizadoEm || data.criadoEm;
+          const tsMs =
+            tsObj && typeof tsObj === 'object' && 'toMillis' in tsObj
+              ? (tsObj as { toMillis: () => number }).toMillis()
+              : Date.now();
+          fsRooms.push({
+            id: docSnap.id,
+            name: String(data.nome || 'Mesa de Poker'),
+            host: String(data.criadorNome || 'Anfitrião'),
+            criadorId: String(data.criadorId || ''),
+            createdAt: tsMs,
+            playerNames,
+            jogadores,
+            jogadoresInfo: infoMap,
+            status: (data.status as PokerRoom['status']) || 'aguardando',
+            isFirestore: true
+          });
+        });
+
+        fsRooms.sort((a, b) => b.createdAt - a.createdAt);
+        setRooms(fsRooms);
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'salas');
+      }
+    );
+
+    return () => unsub();
+  }, [gameMode, effectiveUid]);
+
+  // Listen to active Firestore Poker room in real time so players & game state sync instantly
+  useEffect(() => {
+    if (gameMode !== 'MULTIPLAYER' || !activeRoom?.id || !activeRoom.isFirestore || !effectiveUid) {
+      return;
+    }
+
+    const roomPath = `salas/${activeRoom.id}`;
+    const unsub = onSnapshot(
+      doc(db, 'salas', activeRoom.id),
+      (docSnap) => {
+        if (!docSnap.exists()) {
+          setActiveRoom(null);
+          setTablePlayers([]);
+          showToast('A mesa de Poker foi encerrada.');
+          return;
+        }
+
+        const data = docSnap.data() as Record<string, unknown>;
+        const jogadores = Array.isArray(data.jogadores) ? (data.jogadores as string[]) : [];
+        const infoMap = (data.jogadoresInfo && typeof data.jogadoresInfo === 'object'
+          ? data.jogadoresInfo
+          : {}) as Record<string, PokerPlayerMeta>;
+        const estado = (data.estadoJogo && typeof data.estadoJogo === 'object'
+          ? data.estadoJogo
+          : {}) as Record<string, unknown>;
+
+        const playerNames = jogadores.map((uid) => infoMap[uid]?.nome || uid.slice(0, 8));
+        setActiveRoom((prev) =>
+          prev && prev.id === docSnap.id
+            ? {
+                ...prev,
+                name: String(data.nome || prev.name),
+                host: String(data.criadorNome || prev.host),
+                criadorId: String(data.criadorId || prev.criadorId || ''),
+                playerNames,
+                jogadores,
+                jogadoresInfo: infoMap,
+                status: (data.status as PokerRoom['status']) || 'aguardando',
+                isFirestore: true
+              }
+            : prev
+        );
+
+        const stage = (estado.stage as typeof multiStage) || 'WAITING';
+        setMultiStage(stage);
+        setMultiPot(typeof estado.pot === 'number' ? estado.pot : 0);
+        setCurrentHighestBet(typeof estado.highestBet === 'number' ? estado.highestBet : 0);
+        setActivePlayerIndex(typeof estado.activePlayerIndex === 'number' ? estado.activePlayerIndex : 0);
+        setMultiRevealedCount(typeof estado.revealedCount === 'number' ? estado.revealedCount : 0);
+        setMultiCommunityCards(Array.isArray(estado.communityCards) ? (estado.communityCards as Card[]) : []);
+        setMultiWinnerMsg(typeof estado.winnerMsg === 'string' ? estado.winnerMsg : '');
+
+        if (stage === 'WAITING' || !Array.isArray(estado.players) || (estado.players as unknown[]).length === 0) {
+          const syncedSeated: TablePlayer[] = jogadores.map((uid, idx) => {
+            const meta = infoMap[uid];
+            return {
+              uid,
+              username: meta?.nome || uid.slice(0, 8),
+              chips: typeof meta?.saldo === 'number' ? Math.max(100, meta.saldo) : 10000,
+              holeCards: [],
+              currentStreetBet: 0,
+              totalRoundBet: 0,
+              folded: false,
+              isAllIn: false,
+              isDealer: idx === 0
+            };
+          });
+          setTablePlayers(syncedSeated);
+        } else {
+          setTablePlayers(estado.players as TablePlayer[]);
+        }
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.GET, roomPath);
+      }
+    );
+
+    return () => unsub();
+  }, [gameMode, activeRoom?.id, activeRoom?.isFirestore, effectiveUid]);
 
   const loadRooms = () => {
     try {
@@ -187,7 +345,7 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
       }
     } catch {}
 
-    // Default room
+    // Default local room fallback when not signed in to Firebase
     const defaultRoom: PokerRoom = {
       id: 'room-1',
       name: 'Mesa VIP dos Campeões',
@@ -204,8 +362,102 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     localStorage.setItem(ROOMS_KEY, JSON.stringify(newRooms));
   };
 
-  const handleCreateRoom = () => {
+  const syncPokerEstadoToFirestore = async (
+    roomId: string,
+    roomStatus: 'aguardando' | 'jogando' | 'finalizado',
+    estadoPayload: Record<string, unknown>
+  ) => {
+    try {
+      await updateDoc(doc(db, 'salas', roomId), {
+        status: roomStatus,
+        estadoJogo: {
+          status: roomStatus,
+          ...estadoPayload
+        },
+        atualizadoEm: serverTimestamp()
+      });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.toLowerCase().includes('permission') || msg.toLowerCase().includes('insufficient')) {
+        handleFirestoreError(error, OperationType.UPDATE, `salas/${roomId}`);
+      }
+    }
+  };
+
+  const handleCreateRoom = async () => {
     if (!newRoomName.trim()) return;
+
+    if (effectiveUid) {
+      const roomName = newRoomName.trim().slice(0, 60);
+      const initialPlayer: TablePlayer = {
+        uid: effectiveUid,
+        username: pokerPlayerName,
+        chips: Math.max(100, balance),
+        holeCards: [],
+        currentStreetBet: 0,
+        totalRoundBet: 0,
+        folded: false,
+        isAllIn: false,
+        isDealer: true
+      };
+      try {
+        const docRef = await addDoc(collection(db, 'salas'), {
+          nome: roomName,
+          jogo: 'poker',
+          criadorId: effectiveUid,
+          criadorNome: pokerPlayerName,
+          jogadores: [effectiveUid],
+          jogadoresInfo: {
+            [effectiveUid]: {
+              uid: effectiveUid,
+              nome: pokerPlayerName,
+              avatar: pokerAvatar,
+              saldo: Math.max(100, balance)
+            }
+          },
+          maxJogadores: 8,
+          status: 'aguardando',
+          apostaMinima: 50,
+          estadoJogo: {
+            status: 'aguardando',
+            stage: 'WAITING',
+            pot: 0,
+            highestBet: 0,
+            activePlayerIndex: 0,
+            communityCards: [],
+            revealedCount: 0,
+            players: [initialPlayer],
+            winnerMsg: ''
+          },
+          criadoEm: serverTimestamp(),
+          atualizadoEm: serverTimestamp()
+        });
+        const createdRoom: PokerRoom = {
+          id: docRef.id,
+          name: roomName,
+          host: pokerPlayerName,
+          criadorId: effectiveUid,
+          createdAt: Date.now(),
+          playerNames: [pokerPlayerName],
+          jogadores: [effectiveUid],
+          isFirestore: true
+        };
+        setNewRoomName('');
+        setActiveRoom(createdRoom);
+        setTablePlayers([initialPlayer]);
+        setMultiStage('WAITING');
+        setMultiWinnerMsg('');
+        soundManager.playClick();
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        if (msg.toLowerCase().includes('permission') || msg.toLowerCase().includes('insufficient')) {
+          handleFirestoreError(error, OperationType.CREATE, 'salas');
+        }
+        showToast('Não foi possível criar a sala de Poker no Firestore.');
+      }
+      return;
+    }
+
     const accounts = getStoredAccounts();
     const hostName = accounts[0]?.username || 'Jogador';
 
@@ -220,20 +472,57 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     const updated = [newRoom, ...rooms];
     saveRooms(updated);
     setNewRoomName('');
-    handleJoinRoom(newRoom);
+    void handleJoinRoom(newRoom);
   };
 
-  const handleJoinRoom = (room: PokerRoom) => {
+  const handleJoinRoom = async (room: PokerRoom) => {
+    if (room.isFirestore && effectiveUid) {
+      const alreadyIn = room.jogadores?.includes(effectiveUid);
+      if (!alreadyIn) {
+        if (room.status === 'jogando') {
+          showToast('Esta mesa está com uma mão em andamento. Aguarde finalizar ou entre em outra sala.');
+          return;
+        }
+        if ((room.jogadores?.length || 0) >= 8) {
+          showToast('Mesa cheia (máximo 8 jogadores)!');
+          return;
+        }
+        try {
+          await updateDoc(doc(db, 'salas', room.id), {
+            jogadores: arrayUnion(effectiveUid),
+            [`jogadoresInfo.${effectiveUid}`]: {
+              uid: effectiveUid,
+              nome: pokerPlayerName,
+              avatar: pokerAvatar,
+              saldo: Math.max(100, balance)
+            },
+            atualizadoEm: serverTimestamp()
+          });
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          if (msg.toLowerCase().includes('permission') || msg.toLowerCase().includes('insufficient')) {
+            handleFirestoreError(error, OperationType.UPDATE, `salas/${room.id}`);
+          }
+          showToast('Erro ao entrar na sala de Poker.');
+          return;
+        }
+      }
+      setActiveRoom(room);
+      setMultiStage('WAITING');
+      setMultiWinnerMsg('');
+      soundManager.playClick();
+      return;
+    }
+
     setActiveRoom(room);
     setMultiStage('WAITING');
     setMultiWinnerMsg('');
     soundManager.playClick();
 
-    // Populate seated players from registered accounts
+    // Populate seated players from local registered accounts
     const allAccounts = getStoredAccounts();
     let seatedNames = room.playerNames;
 
-    // If room is empty, seat up to 4 available registered accounts
     if (seatedNames.length < 2 && allAccounts.length >= 2) {
       seatedNames = allAccounts.slice(0, 4).map(a => a.username);
       room.playerNames = seatedNames;
@@ -255,6 +544,36 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     });
 
     setTablePlayers(seated);
+  };
+
+  const handleLeavePokerRoom = async () => {
+    if (!activeRoom) return;
+    if (activeRoom.isFirestore && effectiveUid) {
+      const remaining = (activeRoom.jogadores || []).filter((id) => id !== effectiveUid);
+      try {
+        if (remaining.length === 0) {
+          await deleteDoc(doc(db, 'salas', activeRoom.id));
+        } else {
+          const nextCreatorId =
+            activeRoom.criadorId === effectiveUid ? remaining[0] : activeRoom.criadorId;
+          const nextCreatorName =
+            activeRoom.criadorId === effectiveUid
+              ? activeRoom.jogadoresInfo?.[remaining[0]]?.nome || 'Jogador'
+              : activeRoom.host;
+          await updateDoc(doc(db, 'salas', activeRoom.id), {
+            jogadores: arrayRemove(effectiveUid),
+            criadorId: nextCreatorId,
+            criadorNome: nextCreatorName,
+            atualizadoEm: serverTimestamp()
+          });
+        }
+      } catch (error) {
+        console.warn('Erro ao sair da sala de Poker:', error);
+      }
+    }
+    setActiveRoom(null);
+    setTablePlayers([]);
+    setMultiStage('WAITING');
   };
 
   const handleAddPlayerToRoom = () => {
@@ -285,9 +604,21 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     const nextPlayers = [...tablePlayers, newPlayer];
     setTablePlayers(nextPlayers);
 
-    // Update room
-    activeRoom.playerNames = nextPlayers.map(p => p.username);
-    saveRooms(rooms.map(r => r.id === activeRoom.id ? activeRoom : r));
+    if (activeRoom.isFirestore) {
+      void syncPokerEstadoToFirestore(activeRoom.id, 'aguardando', {
+        stage: 'WAITING',
+        pot: 0,
+        highestBet: 0,
+        activePlayerIndex: 0,
+        communityCards: [],
+        revealedCount: 0,
+        players: nextPlayers,
+        winnerMsg: ''
+      });
+    } else {
+      activeRoom.playerNames = nextPlayers.map(p => p.username);
+      saveRooms(rooms.map(r => r.id === activeRoom.id ? activeRoom : r));
+    }
     setSelectedUserToJoin('');
     soundManager.playChip();
   };
@@ -347,6 +678,19 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     setMultiRaiseAmount(bigBlind * 2);
     soundManager.playCardDeal();
 
+    if (activeRoom?.isFirestore) {
+      void syncPokerEstadoToFirestore(activeRoom.id, 'jogando', {
+        stage: 'PREFLOP',
+        pot,
+        highestBet: bigBlind,
+        activePlayerIndex: nextTurnIdx,
+        communityCards: comm,
+        revealedCount: 0,
+        players: updated,
+        winnerMsg: ''
+      });
+    }
+
     if (activeRoom?.id) {
       const nextTurnUser = updated[nextTurnIdx]?.username || '';
       void enviarJogadaRtdb(activeRoom.id, {
@@ -363,7 +707,7 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     soundManager.playLoss();
     const updated = [...tablePlayers];
     const currName = updated[activePlayerIndex]?.username || 'Jogador';
-    updated[activePlayerIndex].folded = true;
+    updated[activePlayerIndex] = { ...updated[activePlayerIndex], folded: true };
     setTablePlayers(updated);
     if (activeRoom?.id) {
       void enviarJogadaRtdb(activeRoom.id, {
@@ -371,14 +715,15 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
         ultimaAcao: `${currName} deu Fold`
       });
     }
-    advanceMultiTurn(updated);
+    advanceMultiTurn(updated, multiPot, currentHighestBet);
   };
 
   const handleMultiCallOrCheck = () => {
     soundManager.playClick();
     const updated = [...tablePlayers];
-    const curr = updated[activePlayerIndex];
+    const curr = { ...updated[activePlayerIndex] };
     const needed = currentHighestBet - curr.currentStreetBet;
+    let nextPot = multiPot;
 
     if (needed > 0) {
       const callAmt = Math.min(curr.chips, needed);
@@ -386,9 +731,12 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
       curr.currentStreetBet += callAmt;
       curr.totalRoundBet += callAmt;
       if (curr.chips === 0) curr.isAllIn = true;
-      setMultiPot(prev => prev + callAmt);
+      nextPot += callAmt;
+      setMultiPot(nextPot);
       soundManager.playChip();
     }
+    updated[activePlayerIndex] = curr;
+    setTablePlayers(updated);
 
     if (activeRoom?.id) {
       void enviarJogadaRtdb(activeRoom.id, {
@@ -397,13 +745,13 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
       });
     }
 
-    advanceMultiTurn(updated);
+    advanceMultiTurn(updated, nextPot, currentHighestBet);
   };
 
   const handleMultiRaise = () => {
     const updated = [...tablePlayers];
-    const curr = updated[activePlayerIndex];
-    if (!curr) return;
+    const curr = { ...updated[activePlayerIndex] };
+    if (!curr.username) return;
     if (multiRaiseAmount <= 0) {
       showToast('Adicione fichas ao Raise antes de apostar!');
       return;
@@ -419,33 +767,49 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     curr.currentStreetBet += targetRaise;
     curr.totalRoundBet += targetRaise;
     if (curr.chips === 0) curr.isAllIn = true;
+    updated[activePlayerIndex] = curr;
 
     const nextHighest = curr.currentStreetBet > currentHighestBet ? curr.currentStreetBet : currentHighestBet;
     if (curr.currentStreetBet > currentHighestBet) {
       setCurrentHighestBet(curr.currentStreetBet);
     }
-
-    setMultiPot(prev => prev + targetRaise);
+    const nextPot = multiPot + targetRaise;
+    setMultiPot(nextPot);
+    setTablePlayers(updated);
     if (activeRoom?.id) {
       void enviarJogadaRtdb(activeRoom.id, {
         apostaAtual: nextHighest,
         ultimaAcao: `${curr.username} deu Raise (+${targetRaise})`
       });
     }
-    advanceMultiTurn(updated);
+    advanceMultiTurn(updated, nextPot, nextHighest);
   };
 
-  const advanceMultiTurn = (currentList: TablePlayer[]) => {
+  const advanceMultiTurn = (currentList: TablePlayer[], potVal = multiPot, highestVal = currentHighestBet) => {
     const active = currentList.filter(p => !p.folded);
 
     if (active.length === 1) {
-      const winner = active[0];
-      winner.chips += multiPot;
+      const winner = { ...active[0], chips: active[0].chips + potVal };
+      const finalList = currentList.map((p) => (p.username === winner.username ? winner : p));
+      const msg = `🏆 ${winner.username} venceu o pote de ${potVal.toLocaleString('pt-BR')} fichas!`;
       soundManager.playWin();
-      setMultiWinnerMsg(`🏆 ${winner.username} venceu o pote de ${multiPot.toLocaleString('pt-BR')} fichas!`);
+      setTablePlayers(finalList);
+      setMultiWinnerMsg(msg);
       setMultiStage('SHOWDOWN');
-      persistMultiBalances(currentList);
-      scheduleVictoryModal(multiPot, "TEXAS HOLD'EM MULTIPLAYER", `Vitória de ${winner.username} (Desistência)`, 350);
+      persistMultiBalances(finalList);
+      scheduleVictoryModal(potVal, "TEXAS HOLD'EM MULTIPLAYER", `Vitória de ${winner.username} (Desistência)`, 350);
+      if (activeRoom?.isFirestore) {
+        void syncPokerEstadoToFirestore(activeRoom.id, 'finalizado', {
+          stage: 'SHOWDOWN',
+          pot: potVal,
+          highestBet: highestVal,
+          activePlayerIndex,
+          communityCards: multiCommunityCards,
+          revealedCount: multiRevealedCount,
+          players: finalList,
+          winnerMsg: msg
+        });
+      }
       return;
     }
 
@@ -456,13 +820,25 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
       loops++;
     }
 
-    const allMatched = active.every(p => p.isAllIn || p.currentStreetBet === currentHighestBet);
+    const allMatched = active.every(p => p.isAllIn || p.currentStreetBet === highestVal);
 
     if (allMatched && loops < currentList.length) {
-      advanceMultiStreet(currentList);
+      advanceMultiStreet(currentList, potVal);
     } else {
       setActivePlayerIndex(nextIdx);
       setPeekHoleCards(false);
+      if (activeRoom?.isFirestore) {
+        void syncPokerEstadoToFirestore(activeRoom.id, 'jogando', {
+          stage: multiStage,
+          pot: potVal,
+          highestBet: highestVal,
+          activePlayerIndex: nextIdx,
+          communityCards: multiCommunityCards,
+          revealedCount: multiRevealedCount,
+          players: currentList,
+          winnerMsg: ''
+        });
+      }
       if (activeRoom?.id && currentList[nextIdx]) {
         const nextUser = currentList[nextIdx].username;
         void enviarJogadaRtdb(activeRoom.id, {
@@ -473,30 +849,50 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     }
   };
 
-  const advanceMultiStreet = (currentList: TablePlayer[]) => {
+  const advanceMultiStreet = (currentList: TablePlayer[], potVal = multiPot) => {
     const resetList = currentList.map(p => ({ ...p, currentStreetBet: 0 }));
     setCurrentHighestBet(0);
     setActivePlayerIndex(0);
     setPeekHoleCards(false);
+    setTablePlayers(resetList);
+
+    let nextStage = multiStage;
+    let nextRevealed = multiRevealedCount;
 
     if (multiStage === 'PREFLOP') {
       soundManager.playCardDeal();
-      setMultiRevealedCount(3);
-      setMultiStage('FLOP');
+      nextRevealed = 3;
+      nextStage = 'FLOP';
     } else if (multiStage === 'FLOP') {
       soundManager.playCardDeal();
-      setMultiRevealedCount(4);
-      setMultiStage('TURN');
+      nextRevealed = 4;
+      nextStage = 'TURN';
     } else if (multiStage === 'TURN') {
       soundManager.playCardDeal();
-      setMultiRevealedCount(5);
-      setMultiStage('RIVER');
+      nextRevealed = 5;
+      nextStage = 'RIVER';
     } else if (multiStage === 'RIVER') {
-      triggerMultiShowdown(resetList);
+      triggerMultiShowdown(resetList, potVal);
+      return;
+    }
+
+    setMultiRevealedCount(nextRevealed);
+    setMultiStage(nextStage);
+    if (activeRoom?.isFirestore) {
+      void syncPokerEstadoToFirestore(activeRoom.id, 'jogando', {
+        stage: nextStage,
+        pot: potVal,
+        highestBet: 0,
+        activePlayerIndex: 0,
+        communityCards: multiCommunityCards,
+        revealedCount: nextRevealed,
+        players: resetList,
+        winnerMsg: ''
+      });
     }
   };
 
-  const triggerMultiShowdown = (currentList: TablePlayer[]) => {
+  const triggerMultiShowdown = (currentList: TablePlayer[], potVal = multiPot) => {
     setMultiStage('SHOWDOWN');
     setMultiRevealedCount(5);
 
@@ -510,13 +906,27 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
     activeShowdown.sort((a, b) => comparePokerHands(b.handResult!, a.handResult!));
 
     const winner = activeShowdown[0];
-    winner.chips += multiPot;
+    winner.chips += potVal;
+    const msg = `🎉 ${winner.username} venceu o pote com ${winner.handResult?.name}! (+${potVal.toLocaleString('pt-BR')} fichas)`;
 
     soundManager.playJackpot();
-    setMultiWinnerMsg(`🎉 ${winner.username} venceu o pote com ${winner.handResult?.name}! (+${multiPot.toLocaleString('pt-BR')} fichas)`);
+    setMultiWinnerMsg(msg);
     setTablePlayers(evaluated);
     persistMultiBalances(evaluated);
-    scheduleVictoryModal(multiPot, "TEXAS HOLD'EM MULTIPLAYER", `${winner.username} · ${winner.handResult?.name || ''}`, 950);
+    scheduleVictoryModal(potVal, "TEXAS HOLD'EM MULTIPLAYER", `${winner.username} · ${winner.handResult?.name || ''}`, 950);
+
+    if (activeRoom?.isFirestore) {
+      void syncPokerEstadoToFirestore(activeRoom.id, 'finalizado', {
+        stage: 'SHOWDOWN',
+        pot: potVal,
+        highestBet: 0,
+        activePlayerIndex: 0,
+        communityCards: multiCommunityCards,
+        revealedCount: 5,
+        players: evaluated,
+        winnerMsg: msg
+      });
+    }
   };
 
   const persistMultiBalances = (finalList: TablePlayer[]) => {
@@ -674,7 +1084,6 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
           <button
             onClick={() => {
               setGameMode('MULTIPLAYER');
-              if (!activeRoom && rooms.length > 0) handleJoinRoom(rooms[0]);
             }}
             className={`px-3 py-1 rounded-lg text-xs font-cinzel font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
               gameMode === 'MULTIPLAYER'
@@ -688,36 +1097,53 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
         </div>
       </div>
 
-      {/* MULTIPLAYER LOCAL ROOM BAR & LOBBY */}
+      {/* MULTIPLAYER ROOM BAR & LOBBY */}
       {gameMode === 'MULTIPLAYER' && (
         <div className="bg-[#180705] border border-orange-500/35 rounded-2xl p-3 shadow-xl space-y-2.5">
+          {!effectiveUid && (
+            <div className="bg-[#240a06] border border-amber-500/40 rounded-xl p-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-200">
+              <span>Faça login no Firebase para ver e entrar nas salas online de outros jogadores.</span>
+              <button
+                type="button"
+                onClick={() => onRequestLogin?.()}
+                className="px-3 py-1 rounded-lg bg-amber-500 text-slate-950 font-black cursor-pointer"
+              >
+                Entrar / Criar Conta
+              </button>
+            </div>
+          )}
+
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
             <div className="flex items-center gap-2 flex-wrap">
               <span className="text-xs font-bold text-amber-300 flex items-center gap-1">
                 <Users className="w-3.5 h-3.5 text-orange-400" />
-                <span>Salas ({rooms.length}):</span>
+                <span>Salas Online ({rooms.length}):</span>
               </span>
-              {rooms.map(r => {
-                const isSelected = activeRoom?.id === r.id;
-                return (
-                  <button
-                    key={r.id}
-                    onClick={() => handleJoinRoom(r)}
-                    className={`px-3 py-1 rounded-lg text-xs font-bold border transition-all cursor-pointer flex items-center gap-1.5 shadow ${
-                      isSelected
-                        ? 'bg-gradient-to-r from-orange-600 to-amber-600 text-white border-amber-300'
-                        : 'bg-[#250d09] text-orange-200 border-orange-500/30 hover:bg-[#34130d] hover:border-amber-400 hover:text-white'
-                    }`}
-                  >
-                    <DoorOpen className="w-3 h-3 text-orange-300" />
-                    <span>{r.name}</span>
-                    <span className="text-[10px] opacity-80">({r.playerNames.length}/8)</span>
-                  </button>
-                );
-              })}
+              {rooms.length === 0 ? (
+                <span className="text-xs text-orange-200/60">Nenhuma sala aberta ainda. Crie a primeira!</span>
+              ) : (
+                rooms.map(r => {
+                  const isSelected = activeRoom?.id === r.id;
+                  return (
+                    <button
+                      key={r.id}
+                      onClick={() => void handleJoinRoom(r)}
+                      className={`px-3 py-1 rounded-lg text-xs font-bold border transition-all cursor-pointer flex items-center gap-1.5 shadow ${
+                        isSelected
+                          ? 'bg-gradient-to-r from-orange-600 to-amber-600 text-white border-amber-300'
+                          : 'bg-[#250d09] text-orange-200 border-orange-500/30 hover:bg-[#34130d] hover:border-amber-400 hover:text-white'
+                      }`}
+                    >
+                      <DoorOpen className="w-3 h-3 text-orange-300" />
+                      <span>{r.name}</span>
+                      <span className="text-[10px] opacity-80">({r.playerNames.length}/8)</span>
+                    </button>
+                  );
+                })
+              )}
             </div>
 
-            {/* Create new local room */}
+            {/* Create new room */}
             <div className="flex items-center gap-1.5">
               <input
                 type="text"
@@ -727,7 +1153,7 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
                 className="px-2.5 py-1.5 rounded-lg bg-[#200805] border border-orange-500/35 text-xs text-orange-100 placeholder:text-orange-400/40 w-48 sm:w-56 focus:outline-none focus:border-amber-400"
               />
               <button
-                onClick={handleCreateRoom}
+                onClick={() => void handleCreateRoom()}
                 disabled={!newRoomName.trim()}
                 className="px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-500 hover:to-amber-500 text-white font-bold text-xs flex items-center gap-1 cursor-pointer shadow disabled:opacity-50"
               >
@@ -739,14 +1165,14 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
 
           {activeRoom && (
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-orange-500/20 pt-2">
-              <div className="flex items-center gap-2 text-xs text-orange-200">
+              <div className="flex items-center gap-2 text-xs text-orange-200 flex-wrap">
                 <span className="font-bold text-amber-300">Adicionar Jogador à Mesa:</span>
                 <select
                   value={selectedUserToJoin}
                   onChange={(e) => setSelectedUserToJoin(e.target.value)}
                   className="px-2.5 py-1 rounded-lg bg-[#200805] border border-orange-500/35 text-xs text-orange-100 focus:outline-none focus:border-amber-400"
                 >
-                  <option value="">Selecione um usuário cadastrado...</option>
+                  <option value="">Selecione um usuário local...</option>
                   {allRegisteredUsers.map((u: UserAccount) => (
                     <option key={u.username} value={u.username}>
                       {u.username} (🪙 {u.balance.toLocaleString('pt-BR')})
@@ -762,6 +1188,14 @@ export const TexasHoldemGame: React.FC<TexasHoldemGameProps> = ({
                   + Sentar na Mesa
                 </button>
               </div>
+
+              <button
+                type="button"
+                onClick={() => void handleLeavePokerRoom()}
+                className="px-3 py-1 rounded-lg bg-red-950/80 hover:bg-red-900 border border-red-500/50 text-red-200 text-xs font-bold cursor-pointer"
+              >
+                Sair da Mesa
+              </button>
             </div>
           )}
         </div>

@@ -6,6 +6,19 @@ import { LiarsBarVictoryModal } from '../components/LiarsBarVictoryModal';
 import { ChipSelector } from '../components/ChipSelector';
 import { getStoredAccounts } from '../utils/auth';
 import { incrementMissionCounter } from '../utils/missions';
+import { UserAccount } from '../types/casino';
+import {
+  collection,
+  doc,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  onSnapshot,
+  arrayUnion,
+  arrayRemove,
+  serverTimestamp
+} from 'firebase/firestore';
+import { auth, db, handleFirestoreError, OperationType } from '../firebase';
 import {
   ArrowLeft,
   HelpCircle,
@@ -19,6 +32,9 @@ interface LiarsBarGameProps {
   onUpdateBalance: (delta: number, isWin: boolean, gameId: 'liars-bar', betAmount?: number) => void;
   onBackToLobby: () => void;
   username?: string;
+  currentUser?: UserAccount | null;
+  firebaseUid?: string | null;
+  onRequestLogin?: () => void;
 }
 
 type CardType = 'A' | 'K' | 'Q' | 'DEVIL';
@@ -42,14 +58,26 @@ interface Player {
   isEliminated: boolean;
 }
 
+interface LiarsPlayerMeta {
+  uid: string;
+  nome: string;
+  avatar?: string;
+  aposta?: number;
+}
+
 interface LiarsRoom {
   id: string;
   name: string;
   host: string;
+  criadorId?: string;
   createdAt: number;
   maxPlayers: number;
   playerNames: string[];
+  jogadores?: string[];
+  jogadoresInfo?: Record<string, LiarsPlayerMeta>;
+  bots?: string[];
   status: 'aberta' | 'em-andamento' | 'fechada';
+  isFirestore?: boolean;
 }
 
 const CHARACTERS: { name: string; type: CharType }[] = [
@@ -245,8 +273,14 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
   balance,
   onUpdateBalance,
   onBackToLobby,
-  username = 'Jogador'
+  username = 'Jogador',
+  currentUser,
+  firebaseUid,
+  onRequestLogin
 }) => {
+  const effectiveUid = firebaseUid || auth.currentUser?.uid || null;
+  const displayName = (currentUser?.nickname || currentUser?.username || auth.currentUser?.displayName || username || 'Jogador').slice(0, 32);
+  const playerAvatar = (currentUser?.avatar || '🦁').slice(0, 16);
   const [gameState, setGameState] = useState<'ROOMS_LOBBY' | 'WAITING' | 'PLAYING' | 'REVEAL' | 'ROULETTE' | 'GAME_OVER'>('ROOMS_LOBBY');
   const [entryBet, setEntryBet] = useState<number>(100);
   const [tableTarget, setTableTarget] = useState<'A' | 'K' | 'Q'>('K');
@@ -321,13 +355,159 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
     setTimeout(() => setToastMsg((prev) => (prev === msg ? null : prev)), 3500);
   };
 
-  // Load rooms from localStorage
+  // Listen to ALL Liar's Bar rooms in real time via Firestore (or localStorage fallback if unauthenticated)
   useEffect(() => {
-    loadRooms();
+    if (!effectiveUid) {
+      loadRooms();
+      return () => {
+        clearAllTimers();
+      };
+    }
+
+    const unsub = onSnapshot(
+      collection(db, 'salas'),
+      (snapshot) => {
+        const fsRooms: LiarsRoom[] = [];
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data() as Record<string, unknown>;
+          if (data.jogo !== 'liars-bar') return;
+          const jogadores = Array.isArray(data.jogadores) ? (data.jogadores as string[]) : [];
+          const infoMap = (data.jogadoresInfo && typeof data.jogadoresInfo === 'object'
+            ? data.jogadoresInfo
+            : {}) as Record<string, LiarsPlayerMeta>;
+          const estado = (data.estadoJogo && typeof data.estadoJogo === 'object'
+            ? data.estadoJogo
+            : {}) as Record<string, unknown>;
+          const bots = Array.isArray(estado.bots) ? (estado.bots as string[]) : [];
+          const humanNames = jogadores.map((uid) => infoMap[uid]?.nome || uid.slice(0, 8));
+          const tsObj = data.atualizadoEm || data.criadoEm;
+          const tsMs =
+            tsObj && typeof tsObj === 'object' && 'toMillis' in tsObj
+              ? (tsObj as { toMillis: () => number }).toMillis()
+              : Date.now();
+          const rawStatus = String(data.status || 'aguardando');
+          const mappedStatus: LiarsRoom['status'] =
+            rawStatus === 'jogando'
+              ? 'em-andamento'
+              : rawStatus === 'finalizado'
+              ? 'fechada'
+              : 'aberta';
+          fsRooms.push({
+            id: docSnap.id,
+            name: String(data.nome || "Mesa de Liar's Bar"),
+            host: String(data.criadorNome || 'Anfitrião'),
+            criadorId: String(data.criadorId || ''),
+            createdAt: tsMs,
+            maxPlayers: typeof data.maxJogadores === 'number' ? data.maxJogadores : 5,
+            playerNames: [...humanNames, ...bots],
+            jogadores,
+            jogadoresInfo: infoMap,
+            bots,
+            status: mappedStatus,
+            isFirestore: true
+          });
+        });
+
+        fsRooms.sort((a, b) => b.createdAt - a.createdAt);
+        setRooms(fsRooms);
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'salas');
+      }
+    );
+
     return () => {
+      unsub();
       clearAllTimers();
     };
-  }, []);
+  }, [effectiveUid]);
+
+  // Listen to active Firestore Liar's Bar room so players entering/leaving appear in real time
+  useEffect(() => {
+    if (!activeRoom?.id || !activeRoom.isFirestore || !effectiveUid) return;
+
+    const roomPath = `salas/${activeRoom.id}`;
+    const unsub = onSnapshot(
+      doc(db, 'salas', activeRoom.id),
+      (docSnap) => {
+        if (!docSnap.exists()) {
+          setActiveRoom(null);
+          setGameState('ROOMS_LOBBY');
+          showToast('A taverna foi encerrada.');
+          return;
+        }
+        const data = docSnap.data() as Record<string, unknown>;
+        const jogadores = Array.isArray(data.jogadores) ? (data.jogadores as string[]) : [];
+        const infoMap = (data.jogadoresInfo && typeof data.jogadoresInfo === 'object'
+          ? data.jogadoresInfo
+          : {}) as Record<string, LiarsPlayerMeta>;
+        const estado = (data.estadoJogo && typeof data.estadoJogo === 'object'
+          ? data.estadoJogo
+          : {}) as Record<string, unknown>;
+        const bots = Array.isArray(estado.bots) ? (estado.bots as string[]) : [];
+        const humanNames = jogadores.map((uid) => infoMap[uid]?.nome || uid.slice(0, 8));
+        const allNames = [...humanNames, ...bots];
+
+        setActiveRoom((prev) =>
+          prev && prev.id === docSnap.id
+            ? {
+                ...prev,
+                name: String(data.nome || prev.name),
+                host: String(data.criadorNome || prev.host),
+                criadorId: String(data.criadorId || prev.criadorId || ''),
+                playerNames: allNames,
+                jogadores,
+                jogadoresInfo: infoMap,
+                bots
+              }
+            : prev
+        );
+
+        if (gameState === 'WAITING') {
+          const seated: Player[] = [
+            ...jogadores.map((uid, idx) => {
+              const pName = infoMap[uid]?.nome || uid.slice(0, 8);
+              const isMe = uid === effectiveUid;
+              const char = CHARACTERS[idx % CHARACTERS.length];
+              return {
+                id: uid,
+                name: pName,
+                charType: char.type,
+                isBot: !isMe,
+                lives: 2,
+                chambersRemaining: 3,
+                chips: entryBet * 5,
+                hand: [],
+                isEliminated: false
+              };
+            }),
+            ...bots.map((botName, bIdx) => {
+              const idx = jogadores.length + bIdx;
+              const char = CHARACTERS[idx % CHARACTERS.length];
+              return {
+                id: `bot-${bIdx}`,
+                name: botName,
+                charType: char.type,
+                isBot: true,
+                lives: 2,
+                chambersRemaining: 3,
+                chips: entryBet * 5,
+                hand: [],
+                isEliminated: false
+              };
+            })
+          ];
+          playersRef.current = seated;
+          setPlayers(seated);
+        }
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.GET, roomPath);
+      }
+    );
+
+    return () => unsub();
+  }, [activeRoom?.id, activeRoom?.isFirestore, effectiveUid, gameState, entryBet]);
 
   const loadRooms = () => {
     try {
@@ -370,34 +550,124 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
     localStorage.setItem(LIARS_ROOMS_KEY, JSON.stringify(newRooms));
   };
 
-  const handleCreateRoom = () => {
+  const handleCreateRoom = async () => {
     if (!newRoomName.trim()) return;
+
+    if (effectiveUid) {
+      const cleanRoomName = newRoomName.trim().slice(0, 60);
+      try {
+        const docRef = await addDoc(collection(db, 'salas'), {
+          nome: cleanRoomName,
+          jogo: 'liars-bar',
+          criadorId: effectiveUid,
+          criadorNome: displayName,
+          jogadores: [effectiveUid],
+          jogadoresInfo: {
+            [effectiveUid]: {
+              uid: effectiveUid,
+              nome: displayName,
+              avatar: playerAvatar,
+              aposta: entryBet
+            }
+          },
+          maxJogadores: 5,
+          status: 'aguardando',
+          apostaMinima: Math.max(1, entryBet),
+          estadoJogo: {
+            status: 'aguardando',
+            bots: []
+          },
+          criadoEm: serverTimestamp(),
+          atualizadoEm: serverTimestamp()
+        });
+        const created: LiarsRoom = {
+          id: docRef.id,
+          name: cleanRoomName,
+          host: displayName,
+          criadorId: effectiveUid,
+          createdAt: Date.now(),
+          maxPlayers: 5,
+          playerNames: [displayName],
+          jogadores: [effectiveUid],
+          bots: [],
+          status: 'aberta',
+          isFirestore: true
+        };
+        setNewRoomName('');
+        setShowCreateModal(false);
+        void handleJoinRoom(created);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        if (msg.toLowerCase().includes('permission') || msg.toLowerCase().includes('insufficient')) {
+          handleFirestoreError(error, OperationType.CREATE, 'salas');
+        }
+        showToast("Erro ao criar sala de Liar's Bar no Firestore.");
+      }
+      return;
+    }
+
     const newRoom: LiarsRoom = {
       id: `liars-room-${Date.now()}`,
       name: newRoomName.trim(),
-      host: username,
+      host: displayName,
       createdAt: Date.now(),
       maxPlayers: 5,
-      playerNames: [username],
+      playerNames: [displayName],
       status: 'aberta'
     };
     const updated = [newRoom, ...rooms];
     saveRooms(updated);
     setNewRoomName('');
     setShowCreateModal(false);
-    handleJoinRoom(newRoom);
+    void handleJoinRoom(newRoom);
   };
 
-  const handleJoinRoom = (room: LiarsRoom) => {
+  const handleJoinRoom = async (room: LiarsRoom) => {
     soundManager.playClick();
 
+    if (room.isFirestore && effectiveUid) {
+      const alreadyIn = room.jogadores?.includes(effectiveUid);
+      if (!alreadyIn) {
+        if (room.status === 'em-andamento') {
+          showToast('Esta partida já está em andamento!');
+          return;
+        }
+        if (room.playerNames.length >= room.maxPlayers) {
+          showToast('Sala lotada!');
+          return;
+        }
+        try {
+          await updateDoc(doc(db, 'salas', room.id), {
+            jogadores: arrayUnion(effectiveUid),
+            [`jogadoresInfo.${effectiveUid}`]: {
+              uid: effectiveUid,
+              nome: displayName,
+              avatar: playerAvatar,
+              aposta: entryBet
+            },
+            atualizadoEm: serverTimestamp()
+          });
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          if (msg.toLowerCase().includes('permission') || msg.toLowerCase().includes('insufficient')) {
+            handleFirestoreError(error, OperationType.UPDATE, `salas/${room.id}`);
+          }
+          showToast('Erro ao entrar na sala.');
+          return;
+        }
+      }
+      setActiveRoom(room);
+      setGameState('WAITING');
+      return;
+    }
+
     let currentNames = [...room.playerNames];
-    const hasMe = currentNames.some((n) => n.toLowerCase() === username.toLowerCase());
+    const hasMe = currentNames.some((n) => n.toLowerCase() === displayName.toLowerCase());
     if (!hasMe) {
       if (currentNames.length < room.maxPlayers) {
-        currentNames.push(username);
+        currentNames.push(displayName);
       } else {
-        currentNames[currentNames.length - 1] = username;
+        currentNames[currentNames.length - 1] = displayName;
       }
       room.playerNames = currentNames;
       saveRooms(rooms.map(r => r.id === room.id ? room : r));
@@ -406,7 +676,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
 
     // Build player models
     const seatedPlayers: Player[] = currentNames.map((pName, idx) => {
-      const isMe = pName.toLowerCase() === username.toLowerCase();
+      const isMe = pName.toLowerCase() === displayName.toLowerCase();
       const char = CHARACTERS[idx % CHARACTERS.length];
       return {
         id: `p-${idx}`,
@@ -425,10 +695,59 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
     setGameState('WAITING');
   };
 
-  const handleAddPlayerOrBot = () => {
-    if (!activeRoom || activeRoom.playerNames.length >= 5) return;
-    const botIdx = activeRoom.playerNames.length;
+  const handleLeaveRoom = async () => {
+    if (activeRoom?.isFirestore && effectiveUid) {
+      const remaining = (activeRoom.jogadores || []).filter((id) => id !== effectiveUid);
+      try {
+        if (remaining.length === 0) {
+          await deleteDoc(doc(db, 'salas', activeRoom.id));
+        } else {
+          const nextCreatorId =
+            activeRoom.criadorId === effectiveUid ? remaining[0] : activeRoom.criadorId;
+          const nextCreatorName =
+            activeRoom.criadorId === effectiveUid
+              ? activeRoom.jogadoresInfo?.[remaining[0]]?.nome || 'Jogador'
+              : activeRoom.host;
+          await updateDoc(doc(db, 'salas', activeRoom.id), {
+            jogadores: arrayRemove(effectiveUid),
+            criadorId: nextCreatorId,
+            criadorNome: nextCreatorName,
+            atualizadoEm: serverTimestamp()
+          });
+        }
+      } catch (error) {
+        console.warn("Erro ao sair da sala de Liar's Bar:", error);
+      }
+    }
+    setGameState('ROOMS_LOBBY');
+    setActiveRoom(null);
+  };
+
+  const handleAddPlayerOrBot = async () => {
+    if (!activeRoom || players.length >= 5) return;
+    const botIdx = players.length;
     const botName = CHARACTERS[botIdx % CHARACTERS.length].name;
+
+    if (activeRoom.isFirestore) {
+      const nextBots = [...(activeRoom.bots || []), botName];
+      try {
+        await updateDoc(doc(db, 'salas', activeRoom.id), {
+          estadoJogo: {
+            status: 'aguardando',
+            bots: nextBots
+          },
+          atualizadoEm: serverTimestamp()
+        });
+        soundManager.playChip();
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        if (msg.toLowerCase().includes('permission') || msg.toLowerCase().includes('insufficient')) {
+          handleFirestoreError(error, OperationType.UPDATE, `salas/${activeRoom.id}`);
+        }
+      }
+      return;
+    }
+
     const updatedNames = [...activeRoom.playerNames, botName];
     activeRoom.playerNames = updatedNames;
     saveRooms(rooms.map(r => r.id === activeRoom.id ? activeRoom : r));
@@ -452,7 +771,11 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
   const handleHostStartGame = () => {
     if (!activeRoom || players.length < 2) return;
     const isDefaultRoom = activeRoom.id === 'liars-1' || activeRoom.id === 'liars-2';
-    if (activeRoom.host.toLowerCase() !== username.toLowerCase() && !isDefaultRoom) {
+    const isHost =
+      (activeRoom.criadorId && effectiveUid && activeRoom.criadorId === effectiveUid) ||
+      activeRoom.host.toLowerCase() === displayName.toLowerCase() ||
+      isDefaultRoom;
+    if (!isHost) {
       showToast('Apenas o anfitrião da sala pode iniciar o jogo!');
       return;
     }
@@ -464,9 +787,19 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
     soundManager.playShuffle();
     onUpdateBalance(-entryBet, false, 'liars-bar', entryBet);
 
-    // Update room status to em-andamento
-    activeRoom.status = 'em-andamento';
-    saveRooms(rooms.map(r => r.id === activeRoom.id ? activeRoom : r));
+    if (activeRoom.isFirestore) {
+      void updateDoc(doc(db, 'salas', activeRoom.id), {
+        status: 'jogando',
+        estadoJogo: {
+          status: 'jogando',
+          bots: activeRoom.bots || []
+        },
+        atualizadoEm: serverTimestamp()
+      }).catch(() => {});
+    } else {
+      activeRoom.status = 'em-andamento';
+      saveRooms(rooms.map(r => r.id === activeRoom.id ? activeRoom : r));
+    }
 
     setVictoryModal(null);
     setWinnerName('');
@@ -920,8 +1253,19 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
         reportRoundLoss('liars-bar');
       }
       if (activeRoom) {
-        activeRoom.status = 'fechada';
-        saveRooms(rooms.map(r => r.id === activeRoom.id ? activeRoom : r));
+        if (activeRoom.isFirestore) {
+          void updateDoc(doc(db, 'salas', activeRoom.id), {
+            status: 'finalizado',
+            estadoJogo: {
+              status: 'finalizado',
+              bots: activeRoom.bots || []
+            },
+            atualizadoEm: serverTimestamp()
+          }).catch(() => {});
+        } else {
+          activeRoom.status = 'fechada';
+          saveRooms(rooms.map(r => r.id === activeRoom.id ? activeRoom : r));
+        }
       }
     } else {
       setGameState('PLAYING');
@@ -930,14 +1274,22 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
   };
 
   const humanPlayer =
+    players.find((p) => (effectiveUid ? p.id === effectiveUid : !p.isBot)) ||
     players.find((p) => !p.isBot) ||
-    players.find((p) => p.name.toLowerCase() === username.toLowerCase()) ||
+    players.find((p) => p.name.toLowerCase() === displayName.toLowerCase()) ||
     players[0];
   const humanPlayerIdx = Math.max(0, players.findIndex(p => p.id === humanPlayer?.id));
   const isHumanTurn = players[currentTurnIdx]?.id === humanPlayer?.id && !humanPlayer?.isEliminated && (humanPlayer?.lives || 0) > 0;
   const isHumanEliminated = Boolean(humanPlayer && (humanPlayer.isEliminated || humanPlayer.lives <= 0));
   const currentTurnPlayerName = players[currentTurnIdx]?.name || '';
-  const canStartLocalRoom = !!activeRoom && (activeRoom.host.toLowerCase() === username.toLowerCase() || activeRoom.id === 'liars-1' || activeRoom.id === 'liars-2');
+  const canStartLocalRoom = Boolean(
+    activeRoom && (
+      (activeRoom.criadorId && effectiveUid && activeRoom.criadorId === effectiveUid) ||
+      activeRoom.host.toLowerCase() === displayName.toLowerCase() ||
+      activeRoom.id === 'liars-1' ||
+      activeRoom.id === 'liars-2'
+    )
+  );
 
   // Active turn duration: 10s when human acts, 5s when bot acts
   const activeTurnIsBot =
@@ -1057,8 +1409,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
             if (gameState === 'ROOMS_LOBBY') {
               onBackToLobby();
             } else {
-              setGameState('ROOMS_LOBBY');
-              setActiveRoom(null);
+              void handleLeaveRoom();
             }
           }}
           className="btn-dark flex items-center gap-1.5 text-xs py-1.5 px-3"
@@ -1120,6 +1471,19 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
             </div>
           </div>
 
+          {!effectiveUid && (
+            <div className="mt-2 bg-[#240a06] border border-amber-500/40 rounded-xl p-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-200">
+              <span>Faça login no Firebase para ver e entrar nas tavernas online de outros jogadores.</span>
+              <button
+                type="button"
+                onClick={() => onRequestLogin?.()}
+                className="px-3 py-1 rounded-lg bg-amber-500 text-slate-950 font-black cursor-pointer"
+              >
+                Entrar / Criar Conta
+              </button>
+            </div>
+          )}
+
           <div className="mt-2">
             <ChipSelector
               currentBet={entryBet}
@@ -1139,7 +1503,9 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
             ) : (
               rooms.map((room) => {
                 const isFull = room.playerNames.length >= room.maxPlayers;
-                const isInside = room.playerNames.some(p => p.toLowerCase() === username.toLowerCase());
+                const isInside = effectiveUid
+                  ? Boolean(room.jogadores?.includes(effectiveUid))
+                  : room.playerNames.some(p => p.toLowerCase() === displayName.toLowerCase());
                 return (
                   <div
                     key={room.id}
@@ -1162,7 +1528,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
                     </div>
 
                     <button
-                      onClick={() => handleJoinRoom(room)}
+                      onClick={() => void handleJoinRoom(room)}
                       disabled={isFull && !isInside}
                       className="btn-gold py-1.5 px-4 text-xs font-bold"
                     >
@@ -1197,7 +1563,7 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
                     Cancelar
                   </button>
                   <button
-                    onClick={handleCreateRoom}
+                    onClick={() => void handleCreateRoom()}
                     disabled={!newRoomName.trim()}
                     className="btn-gold text-xs py-1.5 px-4 font-bold cursor-pointer disabled:opacity-50"
                   >
@@ -1247,8 +1613,10 @@ export const LiarsBarGame: React.FC<LiarsBarGameProps> = ({
           <div className="relative z-10 flex-1 flex flex-col justify-center items-center py-4">
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 max-w-xl w-full">
               {players.map((p) => {
-                const isHost = p.name.toLowerCase() === activeRoom.host.toLowerCase();
-                const isMe = p.name.toLowerCase() === username.toLowerCase();
+                const isHost =
+                  (activeRoom.criadorId && p.id === activeRoom.criadorId) ||
+                  p.name.toLowerCase() === activeRoom.host.toLowerCase();
+                const isMe = effectiveUid ? p.id === effectiveUid : p.name.toLowerCase() === displayName.toLowerCase();
                 return (
                   <div
                     key={p.id}

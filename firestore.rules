@@ -44,7 +44,7 @@ service cloud.firestore {
     }
 
     // Validation Blueprint: estadoJogo inside SalaJogo
-    function isValidEstadoJogo(estado) {
+    function isValidBlackjackEstado(estado) {
       return estado is map
         && estado.keys().hasAll(['baralho', 'maoDealer', 'maosJogadores', 'turnoAtual', 'status'])
         && estado.keys().hasOnly([
@@ -71,6 +71,16 @@ service cloud.firestore {
         && (!('mensagem' in estado) || (estado.mensagem is string && estado.mensagem.size() <= 200));
     }
 
+    function isValidEstadoJogo(estado, jogo) {
+      return jogo == 'blackjack'
+        ? isValidBlackjackEstado(estado)
+        : (
+          estado is map
+          && estado.keys().size() <= 24
+          && estado.status in ['aguardando', 'jogando', 'finalizado']
+        );
+    }
+
     // Validation Blueprint: SalaJogo (salas/{salaId})
     function isValidSala(data) {
       return data.keys().hasAll([
@@ -88,13 +98,13 @@ service cloud.firestore {
         && data.jogo in ['blackjack', 'poker', 'liars-bar']
         && data.criadorId is string && data.criadorId.size() >= 1 && data.criadorId.size() <= 128
         && data.criadorNome is string && data.criadorNome.size() >= 1 && data.criadorNome.size() <= 32
-        && data.jogadores is list && data.jogadores.size() >= 1 && data.jogadores.size() <= 4 && data.jogadores[0] is string
-        && (!('jogadoresInfo' in data) || (data.jogadoresInfo is map && data.jogadoresInfo.size() <= 4))
-        && data.maxJogadores is int && data.maxJogadores >= 2 && data.maxJogadores <= 4
+        && data.jogadores is list && data.jogadores.size() >= 1 && data.jogadores.size() <= 8 && data.jogadores[0] is string
+        && (!('jogadoresInfo' in data) || (data.jogadoresInfo is map && data.jogadoresInfo.size() <= 8))
+        && data.maxJogadores is int && data.maxJogadores >= 2 && data.maxJogadores <= 8
         && data.jogadores.size() <= data.maxJogadores
         && data.status in ['aguardando', 'jogando', 'finalizado']
         && (!('apostaMinima' in data) || (data.apostaMinima is number && data.apostaMinima >= 1 && data.apostaMinima <= 10000000))
-        && isValidEstadoJogo(data.estadoJogo)
+        && isValidEstadoJogo(data.estadoJogo, data.jogo)
         && data.criadoEm is timestamp
         && data.atualizadoEm is timestamp;
     }
@@ -102,7 +112,7 @@ service cloud.firestore {
     // Action-Based Update Gates for Salas
     function isJoiningRoom() {
       return !(request.auth.uid in existing().jogadores)
-        && existing().status == 'aguardando'
+        && existing().status in ['aguardando', 'finalizado']
         && existing().jogadores.size() < existing().maxJogadores
         && request.auth.uid in incoming().jogadores
         && incoming().jogadores.size() == existing().jogadores.size() + 1
@@ -154,7 +164,7 @@ service cloud.firestore {
     // Collection: salas/{salaId} (Authenticated Realtime Multiplayer Tables)
     match /salas/{salaId} {
       allow get: if isSignedIn() && isValidId(salaId);
-      allow list: if isSignedIn() && resource.data.jogo in ['blackjack', 'poker', 'liars-bar'];
+      allow list: if isSignedIn();
       allow create: if isSignedIn()
         && isValidId(salaId)
         && isValidSala(incoming())

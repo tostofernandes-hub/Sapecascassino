@@ -93,7 +93,7 @@
         },
         "jogadores": {
           "type": "array",
-          "description": "Lista de UIDs dos jogadores na sala (máximo 4 para Blackjack)"
+          "description": "Lista de UIDs dos jogadores na sala (até 4 no Blackjack, 5 no Liar's Bar e 8 no Poker)"
         },
         "jogadoresInfo": {
           "type": "object",
