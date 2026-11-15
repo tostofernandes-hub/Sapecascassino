@@ -1,0 +1,182 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Helpers
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // Validation Blueprint: Usuario (usuarios/{uid})
+    function isValidUsuario(data, uid) {
+      return data.keys().hasAll(['uid', 'nome', 'saldo', 'criadoEm', 'atualizadoEm'])
+        && data.keys().hasOnly(['uid', 'nome', 'email', 'avatar', 'saldo', 'maiorVitoria', 'totalVitorias', 'totalDerrotas', 'criadoEm', 'atualizadoEm'])
+        && data.uid is string && data.uid == request.auth.uid && data.uid == uid
+        && data.nome is string && data.nome.size() >= 1 && data.nome.size() <= 32
+        && (!('email' in data) || (data.email is string && data.email.size() <= 120))
+        && (!('avatar' in data) || (data.avatar is string && data.avatar.size() <= 16))
+        && data.saldo is number && data.saldo >= 0 && data.saldo <= 1000000000
+        && (!('maiorVitoria' in data) || (data.maiorVitoria is number && data.maiorVitoria >= 0 && data.maiorVitoria <= 1000000000))
+        && (!('totalVitorias' in data) || (data.totalVitorias is int && data.totalVitorias >= 0))
+        && (!('totalDerrotas' in data) || (data.totalDerrotas is int && data.totalDerrotas >= 0))
+        && data.criadoEm is timestamp
+        && data.atualizadoEm is timestamp;
+    }
+
+    // Validation Blueprint: estadoJogo inside SalaJogo
+    function isValidEstadoJogo(estado) {
+      return estado is map
+        && estado.keys().hasAll(['baralho', 'maoDealer', 'maosJogadores', 'turnoAtual', 'status'])
+        && estado.keys().hasOnly([
+          'baralho',
+          'maoDealer',
+          'maosJogadores',
+          'apostasJogadores',
+          'jogadoresFinalizados',
+          'resultadosJogadores',
+          'turnoAtual',
+          'status',
+          'roundId',
+          'mensagem'
+        ])
+        && estado.baralho is list && estado.baralho.size() <= 52
+        && estado.maoDealer is list && estado.maoDealer.size() <= 15
+        && estado.maosJogadores is map && estado.maosJogadores.size() <= 4
+        && (!('apostasJogadores' in estado) || (estado.apostasJogadores is map && estado.apostasJogadores.size() <= 4))
+        && (!('jogadoresFinalizados' in estado) || (estado.jogadoresFinalizados is list && estado.jogadoresFinalizados.size() <= 4))
+        && (!('resultadosJogadores' in estado) || (estado.resultadosJogadores is map && estado.resultadosJogadores.size() <= 4))
+        && (estado.turnoAtual == null || (estado.turnoAtual is string && estado.turnoAtual.size() <= 128))
+        && estado.status in ['aguardando', 'jogando', 'finalizado']
+        && (!('roundId' in estado) || (estado.roundId is int && estado.roundId >= 0))
+        && (!('mensagem' in estado) || (estado.mensagem is string && estado.mensagem.size() <= 200));
+    }
+
+    // Validation Blueprint: SalaJogo (salas/{salaId})
+    function isValidSala(data) {
+      return data.keys().hasAll([
+          'nome', 'jogo', 'criadorId', 'criadorNome',
+          'jogadores', 'maxJogadores', 'status', 'estadoJogo',
+          'criadoEm', 'atualizadoEm'
+        ])
+        && data.keys().hasOnly([
+          'id', 'nome', 'jogo', 'criadorId', 'criadorNome',
+          'jogadores', 'jogadoresInfo', 'maxJogadores', 'status',
+          'apostaMinima', 'estadoJogo', 'criadoEm', 'atualizadoEm'
+        ])
+        && (!('id' in data) || (data.id is string && data.id.size() <= 128))
+        && data.nome is string && data.nome.size() >= 1 && data.nome.size() <= 60
+        && data.jogo in ['blackjack', 'poker', 'liars-bar']
+        && data.criadorId is string && data.criadorId.size() >= 1 && data.criadorId.size() <= 128
+        && data.criadorNome is string && data.criadorNome.size() >= 1 && data.criadorNome.size() <= 32
+        && data.jogadores is list && data.jogadores.size() >= 1 && data.jogadores.size() <= 4 && data.jogadores[0] is string
+        && (!('jogadoresInfo' in data) || (data.jogadoresInfo is map && data.jogadoresInfo.size() <= 4))
+        && data.maxJogadores is int && data.maxJogadores >= 2 && data.maxJogadores <= 4
+        && data.jogadores.size() <= data.maxJogadores
+        && data.status in ['aguardando', 'jogando', 'finalizado']
+        && (!('apostaMinima' in data) || (data.apostaMinima is number && data.apostaMinima >= 1 && data.apostaMinima <= 10000000))
+        && isValidEstadoJogo(data.estadoJogo)
+        && data.criadoEm is timestamp
+        && data.atualizadoEm is timestamp;
+    }
+
+    // Action-Based Update Gates for Salas
+    function isJoiningRoom() {
+      return !(request.auth.uid in existing().jogadores)
+        && existing().status == 'aguardando'
+        && existing().jogadores.size() < existing().maxJogadores
+        && request.auth.uid in incoming().jogadores
+        && incoming().jogadores.size() == existing().jogadores.size() + 1
+        && incoming().jogadores.hasAll(existing().jogadores)
+        && incoming().criadorId == existing().criadorId
+        && incoming().diff(existing()).affectedKeys().hasOnly(['jogadores', 'jogadoresInfo', 'atualizadoEm']);
+    }
+
+    function isLeavingRoom() {
+      return request.auth.uid in existing().jogadores
+        && !(request.auth.uid in incoming().jogadores)
+        && existing().jogadores.hasAll(incoming().jogadores)
+        && incoming().jogadores.size() == existing().jogadores.size() - 1
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'jogadores', 'jogadoresInfo', 'criadorId', 'criadorNome', 'estadoJogo', 'status', 'atualizadoEm'
+        ]);
+    }
+
+    function isRoomPlayerAction() {
+      return request.auth.uid in existing().jogadores
+        && incoming().criadorId == existing().criadorId
+        && incoming().jogadores == existing().jogadores
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'estadoJogo', 'status', 'jogadoresInfo', 'apostaMinima', 'atualizadoEm'
+        ]);
+    }
+
+    // Collection: usuarios/{uid} (Owner-only PII & Balance Protection)
+    match /usuarios/{uid} {
+      allow get: if isValidId(uid) && isOwner(uid);
+      allow list: if false;
+      allow create: if isValidId(uid)
+        && isOwner(uid)
+        && isValidUsuario(incoming(), uid)
+        && incoming().criadoEm == request.time
+        && incoming().atualizadoEm == request.time;
+      allow update: if isValidId(uid)
+        && isOwner(uid)
+        && isValidUsuario(incoming(), uid)
+        && incoming().uid == uid
+        && (!('criadoEm' in existing()) || !(existing().criadoEm is timestamp) || incoming().criadoEm == existing().criadoEm)
+        && incoming().atualizadoEm == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'uid', 'nome', 'email', 'avatar', 'saldo', 'maiorVitoria', 'totalVitorias', 'totalDerrotas', 'criadoEm', 'atualizadoEm'
+        ]);
+      allow delete: if false;
+    }
+
+    // Collection: salas/{salaId} (Authenticated Realtime Multiplayer Tables)
+    match /salas/{salaId} {
+      allow get: if isSignedIn() && isValidId(salaId);
+      allow list: if isSignedIn() && resource.data.jogo in ['blackjack', 'poker', 'liars-bar'];
+      allow create: if isSignedIn()
+        && isValidId(salaId)
+        && isValidSala(incoming())
+        && incoming().criadorId == request.auth.uid
+        && request.auth.uid in incoming().jogadores
+        && incoming().jogadores.size() == 1
+        && incoming().status == 'aguardando'
+        && incoming().criadoEm == request.time
+        && incoming().atualizadoEm == request.time;
+      allow update: if isSignedIn()
+        && isValidId(salaId)
+        && isValidSala(incoming())
+        && incoming().jogo == existing().jogo
+        && incoming().criadoEm == existing().criadoEm
+        && incoming().atualizadoEm == request.time
+        && (isJoiningRoom() || isLeavingRoom() || isRoomPlayerAction());
+      allow delete: if isSignedIn()
+        && isValidId(salaId)
+        && (
+          existing().criadorId == request.auth.uid
+          || (request.auth.uid in existing().jogadores && existing().jogadores.size() <= 1)
+        );
+    }
+  }
+}

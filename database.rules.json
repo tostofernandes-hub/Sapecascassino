@@ -1,0 +1,29 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "salas": {
+      "$salaId": {
+        ".read": "auth != null",
+        "estadoJogo": {
+          ".write": "auth != null"
+        },
+        "status_jogadores": {
+          "$uid": {
+            ".write": "auth != null && auth.uid == $uid",
+            ".validate": "newData.hasChildren(['online'])"
+          }
+        },
+        "chat": {
+          ".write": "auth != null",
+          "$msgId": {
+            ".validate": "newData.hasChildren(['autor', 'mensagem', 'timestamp']) && newData.child('autor').isString() && newData.child('autor').val().length <= 32 && newData.child('mensagem').isString() && newData.child('mensagem').val().length >= 1 && newData.child('mensagem').val().length <= 240 && newData.child('timestamp').isNumber()"
+          }
+        },
+        "timer": {
+          ".write": "auth != null"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,154 @@
+{
+  "entities": {
+    "Usuario": {
+      "title": "Usuario",
+      "description": "Perfil e saldo de fichas fictícias do jogador no Sapecas Cassino",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID do usuário autenticado no Firebase Auth"
+        },
+        "nome": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Nome de exibição do jogador"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 120,
+          "description": "E-mail do jogador (PII restrita ao dono da conta)"
+        },
+        "avatar": {
+          "type": "string",
+          "maxLength": 16,
+          "description": "Emoji ou identificador de avatar"
+        },
+        "saldo": {
+          "type": "number",
+          "description": "Saldo atual de fichas fictícias"
+        },
+        "maiorVitoria": {
+          "type": "number",
+          "description": "Maior vitória registrada"
+        },
+        "totalVitorias": {
+          "type": "integer",
+          "description": "Contagem de vitórias"
+        },
+        "totalDerrotas": {
+          "type": "integer",
+          "description": "Contagem de derrotas"
+        },
+        "criadoEm": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp do servidor na criação"
+        },
+        "atualizadoEm": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp do servidor na última atualização"
+        }
+      },
+      "required": ["uid", "nome", "saldo", "criadoEm", "atualizadoEm"]
+    },
+    "SalaJogo": {
+      "title": "SalaJogo",
+      "description": "Sala multiplayer em tempo real para Blackjack, Pôquer e Liar's Bar",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Identificador da sala"
+        },
+        "nome": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "description": "Nome da mesa exibido no lobby"
+        },
+        "jogo": {
+          "type": "string",
+          "enum": ["blackjack", "poker", "liars-bar"],
+          "description": "Identificador do jogo da sala"
+        },
+        "criadorId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID do criador da sala"
+        },
+        "criadorNome": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Nome público do criador da sala"
+        },
+        "jogadores": {
+          "type": "array",
+          "description": "Lista de UIDs dos jogadores na sala (máximo 4 para Blackjack)"
+        },
+        "jogadoresInfo": {
+          "type": "object",
+          "description": "Metadados públicos dos jogadores na sala (nome, avatar, aposta)"
+        },
+        "maxJogadores": {
+          "type": "integer",
+          "description": "Limite de jogadores na mesa"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["aguardando", "jogando", "finalizado"],
+          "description": "Status atual da sala"
+        },
+        "apostaMinima": {
+          "type": "number",
+          "description": "Aposta padrão da mesa"
+        },
+        "estadoJogo": {
+          "type": "object",
+          "description": "Estado sincronizado da partida (baralho, maoDealer, maosJogadores, turnoAtual, status)"
+        },
+        "criadoEm": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp do servidor na criação"
+        },
+        "atualizadoEm": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp do servidor na atualização"
+        }
+      },
+      "required": [
+        "nome",
+        "jogo",
+        "criadorId",
+        "criadorNome",
+        "jogadores",
+        "maxJogadores",
+        "status",
+        "estadoJogo",
+        "criadoEm",
+        "atualizadoEm"
+      ]
+    }
+  },
+  "firestore": {
+    "/usuarios/{uid}": {
+      "schema": { "$ref": "#/entities/Usuario" },
+      "description": "Documentos privados de conta e saldo de cada usuário autenticado"
+    },
+    "/salas/{salaId}": {
+      "schema": { "$ref": "#/entities/SalaJogo" },
+      "description": "Salas multiplayer sincronizadas em tempo real via onSnapshot"
+    }
+  }
+}
